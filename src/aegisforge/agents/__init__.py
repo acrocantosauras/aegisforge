@@ -1,0 +1,1 @@
+"""Agent abstraction for AegisForge."""
