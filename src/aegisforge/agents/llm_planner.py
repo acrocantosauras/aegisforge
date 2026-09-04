@@ -36,7 +36,6 @@ MAX_WORKFLOW_DEPTH = 10
 
 class PlanValidationError(Exception):
     """Raised when a plan fails validation."""
-    pass
 
 
 def validate_plan(plan: ExecutionPlan) -> list[str]:
@@ -260,6 +259,9 @@ class LLMPlannerAgent(BaseAgent):
             {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
             {"role": "user", "content": f"Decompose this request into tasks:\n\n{intent}"},
         ]
+
+        if self._model_provider is None:
+            raise RuntimeError("LLM planner called without a model provider")
 
         start = time.monotonic()
         response = self._model_provider.generate_structured(

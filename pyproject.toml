@@ -46,6 +46,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "integration: real infrastructure tests (require AEGISFORGE_INTEGRATION_TESTS=true)",
+  "realllm: tests against real LLM providers (require AEGISFORGE_REAL_LLM_TESTS=true)",
+]
 
 [tool.ruff]
 line-length = 100
@@ -57,3 +61,12 @@ ignore = ["B008", "BLE001"]  # B008: Depends() in FastAPI; BLE001: intentional s
 python_version = "3.12"
 warn_unused_configs = true
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+  "prometheus_client.*",
+  "docx.*",
+  "jose.*",
+  "redis.*",
+]
+ignore_missing_imports = true

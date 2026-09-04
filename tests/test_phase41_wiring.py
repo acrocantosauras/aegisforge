@@ -5,23 +5,16 @@ into the execution path.
 """
 from __future__ import annotations
 
-import json
-import uuid
-
 from aegisforge.agents.base import AgentExecutionContext, PermissionSpec
-from aegisforge.agents.llm_planner import LLMPlannerAgent
-from aegisforge.agents.rag_agent import RAGAgent
-from aegisforge.agents.research_agent import ResearchAgent
 from aegisforge.approval.service import ApprovalService
 from aegisforge.config import Settings, get_model_provider_from_settings
 from aegisforge.domain.models import (
-    ApprovalStatus,
     AgentType,
-    RiskLevel,
     RequestStatus,
+    RiskLevel,
 )
 from aegisforge.evaluation.critic import LLMCritic
-from aegisforge.llm.providers import DeterministicModelProvider, get_model_provider
+from aegisforge.llm.providers import DeterministicModelProvider
 from aegisforge.rag.embeddings import DeterministicEmbeddingProvider
 from aegisforge.rag.retrieval import RetrievalService
 from aegisforge.rag.vector_store import InMemoryVectorStore, VectorStoreEntry
@@ -30,11 +23,11 @@ from aegisforge.workflows.checkpoint import (
     WorkflowCheckpointer,
 )
 from aegisforge.workflows.langgraph_workflow import (
-    execute_workflow,
     _ctx,
-    plan_node,
-    execute_agent_node,
     evaluate_node,
+    execute_agent_node,
+    execute_workflow,
+    plan_node,
 )
 
 
@@ -48,7 +41,7 @@ class TestF1_LLMPlannerWired:
         _ctx.model_provider = provider
 
         try:
-            context = AgentExecutionContext(
+            AgentExecutionContext(
                 request_id="req-1",
                 workflow_id="wf-1",
                 user_id="user-1",
@@ -70,7 +63,7 @@ class TestF1_LLMPlannerWired:
         """When _ctx.model_provider is None, plan_node should use PlannerAgent."""
         _ctx.model_provider = None
 
-        context = AgentExecutionContext(
+        AgentExecutionContext(
             request_id="req-1",
             workflow_id="wf-1",
             user_id="user-1",
@@ -139,7 +132,7 @@ class TestF2_RAGAgentWired:
         _ctx.retrieval_service = retrieval_service
 
         try:
-            context = AgentExecutionContext(
+            AgentExecutionContext(
                 request_id="req-1",
                 workflow_id="wf-1",
                 user_id="user-1",
@@ -173,7 +166,7 @@ class TestF2_RAGAgentWired:
         """When task type is 'research', ResearchAgent should be used."""
         _ctx.retrieval_service = None
 
-        context = AgentExecutionContext(
+        AgentExecutionContext(
             request_id="req-1",
             workflow_id="wf-1",
             user_id="user-1",
@@ -206,8 +199,9 @@ class TestF3_PrometheusInstrumentation:
 
     def test_metrics_endpoint_returns_data(self):
         """The /metrics endpoint should return prometheus-formatted data."""
-        from aegisforge.app import create_app
         from fastapi.testclient import TestClient
+
+        from aegisforge.app import create_app
         from aegisforge.db.base import Base
         from aegisforge.db.session import get_engine
 
@@ -337,9 +331,9 @@ class TestF8_LLMCriticWired:
     def test_critic_skipped_when_no_provider(self):
         """LLMCritic should skip when no model provider is configured."""
         critic = LLMCritic(model_provider=None)
-        from aegisforge.domain.models import AgentResult, AgentExecutionStatus
+        from aegisforge.domain.models import AgentExecutionStatus, AgentResult
 
-        result = AgentResult(
+        AgentResult(
             agent_name="test",
             agent_type=AgentType.RESEARCH,
             status=AgentExecutionStatus.COMPLETED,
@@ -364,7 +358,7 @@ class TestF8_LLMCriticWired:
         _ctx.critic = LLMCritic(model_provider=provider)
 
         try:
-            from aegisforge.domain.models import AgentResult, AgentExecutionStatus
+            from aegisforge.domain.models import AgentExecutionStatus, AgentResult
 
             state = {
                 "request_id": "req-1",
@@ -462,11 +456,10 @@ class TestF14_ApprovalTenantIsolationAPI:
             json={"email": "org2@test.com", "password": "TestPass123!", "full_name": "Org2"},
         )
 
-        login1 = client.post(
+        client.post(
             "/api/v1/auth/login",
             json={"email": "org1@test.com", "password": "TestPass123!"},
         )
-        token1 = login1.json()["access_token"]
 
         login2 = client.post(
             "/api/v1/auth/login",

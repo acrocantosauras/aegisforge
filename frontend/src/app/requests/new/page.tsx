@@ -66,8 +66,9 @@ export default function NewRequestPage() {
 
           <form onSubmit={handleSubmit}>
             <div className="form-group">
-              <label>Task Description</label>
+              <label htmlFor="intent">Task Description</label>
               <textarea
+                id="intent"
                 value={intent}
                 onChange={(e) => setIntent(e.target.value)}
                 rows={5}

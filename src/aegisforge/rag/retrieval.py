@@ -6,9 +6,9 @@ Never exposes raw database queries to agents.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from aegisforge.domain.models import RetrievalQuery, RetrievalResult
+from aegisforge.observability.metrics import track_rag_retrieval
 from aegisforge.rag.embeddings import EmbeddingProvider
 from aegisforge.rag.vector_store import VectorStore
 
@@ -40,36 +40,40 @@ class RetrievalService:
         if not query.query or not query.query.strip():
             return []
 
-        # Embed the query
-        query_embedding = self._embedding_provider.embed_text(query.query)
+        with track_rag_retrieval() as rag_meta:
+            # Embed the query
+            query_embedding = self._embedding_provider.embed_text(query.query)
 
-        # Search the vector store
-        search_results = self._vector_store.search(
-            query_embedding=query_embedding,
-            top_k=query.top_k,
-            organization_id=query.organization_id,
-            metadata_filter=query.metadata_filter or None,
-            similarity_threshold=query.similarity_threshold,
-        )
-
-        # Convert to domain model
-        results: list[RetrievalResult] = []
-        for sr in search_results:
-            doc_id = sr.metadata.get("document_id", "")
-            results.append(
-                RetrievalResult(
-                    chunk_id=sr.id,
-                    document_id=doc_id,
-                    content=sr.content,
-                    score=sr.score,
-                    source=sr.metadata.get("source", ""),
-                    metadata={
-                        k: v
-                        for k, v in sr.metadata.items()
-                        if k not in ("organization_id",)
-                    },
-                )
+            # Search the vector store
+            search_results = self._vector_store.search(
+                query_embedding=query_embedding,
+                top_k=query.top_k,
+                organization_id=query.organization_id,
+                metadata_filter=query.metadata_filter or None,
+                similarity_threshold=query.similarity_threshold,
             )
+
+            # Convert to domain model
+            results: list[RetrievalResult] = []
+            for sr in search_results:
+                doc_id = sr.metadata.get("document_id", "")
+                results.append(
+                    RetrievalResult(
+                        chunk_id=sr.id,
+                        document_id=doc_id,
+                        content=sr.content,
+                        score=sr.score,
+                        source=sr.metadata.get("source", ""),
+                        metadata={
+                            k: v
+                            for k, v in sr.metadata.items()
+                            if k not in ("organization_id",)
+                        },
+                    )
+                )
+
+            rag_meta["chunk_count"] = len(results)
+            rag_meta["insufficient_context"] = len(results) == 0
 
         logger.info(
             "Retrieved %d chunks for query in org %s (top_k=%d, threshold=%.2f)",

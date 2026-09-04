@@ -1,25 +1,24 @@
 """Approval management API endpoints for AegisForge.
 
-Provides: list pending, approve, reject with authorization.
+Provides: list pending, get, approve, reject with authorization and
+tenant isolation.  Approvals are persisted in PostgreSQL via
+ApprovalRequestModel (DB-backed ApprovalService), never in-memory.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from aegisforge.approval.service import ApprovalService
+from aegisforge.config import Settings, get_settings
 from aegisforge.db.models import UserModel
 from aegisforge.db.session import get_db
-from aegisforge.approval.service import ApprovalService, is_approval_required
-from aegisforge.domain.models import ApprovalStatus, RiskLevel
 from aegisforge.services.auth_service import get_current_user
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
-
-# In-memory approval service (Phase 4 TODO: persist to DB)
-_approval_service = ApprovalService()
 
 
 class ApprovalRead(BaseModel):
@@ -49,31 +48,46 @@ class ApprovalListResponse(BaseModel):
     total: int
 
 
+def _get_approval_service(db: Session, settings: Settings) -> ApprovalService:
+    """Create a DB-backed approval service bound to the request session."""
+    return ApprovalService(
+        session_factory=lambda: db,
+        approval_timeout_hours=settings.approval_timeout_hours,
+    )
+
+
+def _to_read(approval) -> ApprovalRead:  # type: ignore[no-untyped-def]
+    """Convert a domain ApprovalRequest to the response schema."""
+    return ApprovalRead(
+        approval_id=approval.approval_id,
+        job_id=approval.job_id,
+        request_id=approval.request_id,
+        workflow_id=approval.workflow_id,
+        action_description=approval.action_description,
+        requested_by=approval.requested_by,
+        reviewer_id=approval.reviewer_id,
+        risk_level=approval.risk_level.value if hasattr(approval.risk_level, "value") else str(approval.risk_level),
+        status=approval.status.value if hasattr(approval.status, "value") else str(approval.status),
+        reason=approval.reason,
+        decision_reason=approval.decision_reason,
+        created_at=approval.created_at,
+        decided_at=approval.decided_at,
+    )
+
+
 @router.get("", response_model=ApprovalListResponse)
 def list_pending_approvals(
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> ApprovalListResponse:
     """List pending approval requests for the user's organization."""
-    pending = _approval_service.get_pending_approvals(
+    service = _get_approval_service(db, settings)
+    pending = service.get_pending_approvals(
         organization_id=user.organization_id,
     )
     return ApprovalListResponse(
-        approvals=[
-            ApprovalRead(
-                approval_id=a.approval_id,
-                job_id=a.job_id,
-                request_id=a.request_id,
-                workflow_id=a.workflow_id,
-                action_description=a.action_description,
-                requested_by=a.requested_by,
-                risk_level=a.risk_level.value,
-                status=a.status.value,
-                reason=a.reason,
-                created_at=a.created_at,
-            )
-            for a in pending
-        ],
+        approvals=[_to_read(a) for a in pending],
         total=len(pending),
     )
 
@@ -83,29 +97,85 @@ def get_approval(
     approval_id: str,
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> ApprovalRead:
-    """Get an approval request by ID."""
-    approval = _approval_service.get_approval(approval_id)
+    """Get an approval request by ID (tenant-isolated)."""
+    service = _get_approval_service(db, settings)
+    approval = service.get_approval(approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
     # F14: Tenant isolation check
     if approval.organization_id and approval.organization_id != user.organization_id:
         raise HTTPException(status_code=403, detail="Access denied")
-    return ApprovalRead(
-        approval_id=approval.approval_id,
-        job_id=approval.job_id,
-        request_id=approval.request_id,
-        workflow_id=approval.workflow_id,
-        action_description=approval.action_description,
-        requested_by=approval.requested_by,
-        reviewer_id=approval.reviewer_id,
-        risk_level=approval.risk_level.value,
-        status=approval.status.value,
-        reason=approval.reason,
-        decision_reason=approval.decision_reason,
-        created_at=approval.created_at,
-        decided_at=approval.decided_at,
-    )
+    return _to_read(approval)
+
+
+def _authorize_and_decide(
+    approval_id: str,
+    decision: ApprovalDecision,
+    user: UserModel,
+    db: Session,
+    decision_fn: str,
+    settings: Settings,
+) -> ApprovalRead:
+    """Shared authorize → decide → resume flow for approve/reject."""
+    if user.role not in ("admin", "manager"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin or manager roles can approve requests",
+        )
+
+    service = _get_approval_service(db, settings)
+    existing = service.get_approval(approval_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    # F14: Tenant isolation check
+    if existing.organization_id and existing.organization_id != user.organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if decision_fn == "approve":
+        result = service.approve(
+            approval_id,
+            reviewer_id=user.id,
+            decision_reason=decision.decision_reason,
+        )
+    else:
+        result = service.reject(
+            approval_id,
+            reviewer_id=user.id,
+            decision_reason=decision.decision_reason,
+        )
+    if result is None:
+        raise HTTPException(status_code=409, detail="Approval not found or not pending")
+
+    # Resume (or fail) the paused workflow — protected actions only run
+    # after approval; rejection terminates the workflow.
+    if result.workflow_id:
+        try:
+            from aegisforge.services.execution_service import resume_request_after_approval
+
+            resume_request_after_approval(
+                db=db,
+                request_id=result.request_id,
+                workflow_id=result.workflow_id,
+                approval_decision="approved" if decision_fn == "approve" else "rejected",
+                approval_id=result.approval_id,
+                reviewer_id=user.id,
+                organization_id=result.organization_id or user.organization_id,
+                settings=settings,
+            )
+        except Exception as exc:
+            # The decision itself is persisted; resume failures must not
+            # silently hide the decision. Log and surface a warning.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Approval %s decided but workflow resume failed: %s",
+                approval_id,
+                exc,
+            )
+
+    return _to_read(result)
 
 
 @router.post("/{approval_id}/approve", response_model=ApprovalRead)
@@ -114,42 +184,10 @@ def approve_request(
     decision: ApprovalDecision,
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> ApprovalRead:
-    """Approve an approval request. Requires authorization."""
-    # Only admin/manager can approve
-    if user.role not in ("admin", "manager"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only admin or manager roles can approve requests",
-        )
-    # F14: Tenant isolation check
-    existing = _approval_service.get_approval(approval_id)
-    if existing and existing.organization_id and existing.organization_id != user.organization_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    result = _approval_service.approve(
-        approval_id,
-        reviewer_id=user.id,
-        decision_reason=decision.decision_reason,
-    )
-    if result is None:
-        raise HTTPException(status_code=404, detail="Approval not found or not pending")
-
-    return ApprovalRead(
-        approval_id=result.approval_id,
-        job_id=result.job_id,
-        request_id=result.request_id,
-        workflow_id=result.workflow_id,
-        action_description=result.action_description,
-        requested_by=result.requested_by,
-        reviewer_id=result.reviewer_id,
-        risk_level=result.risk_level.value,
-        status=result.status.value,
-        reason=result.reason,
-        decision_reason=result.decision_reason,
-        created_at=result.created_at,
-        decided_at=result.decided_at,
-    )
+    """Approve an approval request and resume the paused workflow."""
+    return _authorize_and_decide(approval_id, decision, user, db, "approve", settings)
 
 
 @router.post("/{approval_id}/reject", response_model=ApprovalRead)
@@ -158,38 +196,7 @@ def reject_request(
     decision: ApprovalDecision,
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> ApprovalRead:
-    """Reject an approval request. Requires authorization."""
-    if user.role not in ("admin", "manager"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only admin or manager roles can reject requests",
-        )
-    # F14: Tenant isolation check
-    existing = _approval_service.get_approval(approval_id)
-    if existing and existing.organization_id and existing.organization_id != user.organization_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    result = _approval_service.reject(
-        approval_id,
-        reviewer_id=user.id,
-        decision_reason=decision.decision_reason,
-    )
-    if result is None:
-        raise HTTPException(status_code=404, detail="Approval not found or not pending")
-
-    return ApprovalRead(
-        approval_id=result.approval_id,
-        job_id=result.job_id,
-        request_id=result.request_id,
-        workflow_id=result.workflow_id,
-        action_description=result.action_description,
-        requested_by=result.requested_by,
-        reviewer_id=result.reviewer_id,
-        risk_level=result.risk_level.value,
-        status=result.status.value,
-        reason=result.reason,
-        decision_reason=result.decision_reason,
-        created_at=result.created_at,
-        decided_at=result.decided_at,
-    )
+    """Reject an approval request and fail the paused workflow."""
+    return _authorize_and_decide(approval_id, decision, user, db, "reject", settings)

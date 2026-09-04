@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -172,50 +171,52 @@ class PgVectorStore(VectorStore):
         self._initialized = False
 
     def _ensure_table(self) -> None:
-        """Create the vector store table if it doesn't exist."""
+        """Create the vector store table if it doesn't exist.
+
+        Raises on failure: in production the caller fails clearly instead
+        of silently degrading to an in-memory vector store.
+        """
         if self._initialized:
             return
-        try:
-            from sqlalchemy import text
+        from sqlalchemy import text
 
-            session = self._session_factory()
-            try:
-                session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                session.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS vector_embeddings (
-                            id VARCHAR(64) PRIMARY KEY,
-                            organization_id VARCHAR(64) NOT NULL DEFAULT '',
-                            content TEXT NOT NULL,
-                            embedding vector({self._dimension}) NOT NULL,
-                            metadata JSONB DEFAULT '{{}}'::jsonb,
-                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                        )
-                    """
+        session = self._session_factory()
+        try:
+            session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            session.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS vector_embeddings (
+                        id VARCHAR(64) PRIMARY KEY,
+                        organization_id VARCHAR(64) NOT NULL DEFAULT '',
+                        content TEXT NOT NULL,
+                        embedding vector({self._dimension}) NOT NULL,
+                        metadata JSONB DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
+                """
                 )
-                session.execute(
-                    text(
-                        "CREATE INDEX IF NOT EXISTS idx_vector_embeddings_org "
-                        "ON vector_embeddings (organization_id)"
-                    )
+            )
+            session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_vector_embeddings_org "
+                    "ON vector_embeddings (organization_id)"
                 )
-                session.execute(
-                    text(
-                        f"CREATE INDEX IF NOT EXISTS idx_vector_embeddings_embedding "
-                        f"ON vector_embeddings USING ivfflat (embedding vector_cosine_ops) "
-                        f"lists = 10"
-                    )
+            )
+            session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_vector_embeddings_embedding "
+                    "ON vector_embeddings USING hnsw (embedding vector_cosine_ops)"
                 )
-                session.commit()
-                self._initialized = True
-            finally:
-                session.close()
+            )
+            session.commit()
+            self._initialized = True
         except Exception as exc:
             logger.warning("Could not initialize pgvector table: %s", exc)
-            # Table may already exist or pgvector extension may not be available
-            self._initialized = True
+            raise RuntimeError(f"pgvector initialization failed: {exc}") from exc
+        finally:
+            if session is not None:
+                session.close()
 
     def add(self, entries: list[VectorStoreEntry], organization_id: str = "") -> None:
         self._ensure_table()
@@ -231,7 +232,8 @@ class PgVectorStore(VectorStore):
                     session.execute(
                         text(
                             "INSERT INTO vector_embeddings (id, organization_id, content, embedding, metadata) "
-                            "VALUES (:id, :org_id, :content, :embedding::vector, :metadata::jsonb)"
+                            "VALUES (:id, :org_id, :content, CAST(:embedding AS vector), "
+                            "CAST(:metadata AS jsonb))"
                         ),
                         {
                             "id": entry.id,
@@ -276,24 +278,28 @@ class PgVectorStore(VectorStore):
 
                 if similarity_threshold > 0:
                     where_clauses.append(
-                        "1 - (embedding <=> :query_embedding::vector) >= :threshold"
+                        "1 - (embedding <=> CAST(:query_embedding AS vector)) >= :threshold"
                     )
                     params["threshold"] = similarity_threshold
 
                 where_sql = " AND ".join(where_clauses)
 
                 query = text(
-                    f"SELECT id, content, 1 - (embedding <=> :query_embedding::vector) as score, metadata "
+                    f"SELECT id, content, 1 - (embedding <=> CAST(:query_embedding AS vector)) as score, metadata "
                     f"FROM vector_embeddings "
                     f"WHERE {where_sql} "
-                    f"ORDER BY embedding <=> :query_embedding::vector "
+                    f"ORDER BY embedding <=> CAST(:query_embedding AS vector) "
                     f"LIMIT :top_k"
                 )
 
                 rows = session.execute(query, params).fetchall()
                 results = []
                 for row in rows:
-                    meta = json.loads(row.metadata) if row.metadata else {}
+                    # psycopg3 returns JSONB as a dict; older drivers as str.
+                    meta = row.metadata
+                    if isinstance(meta, str):
+                        meta = json.loads(meta) if meta else {}
+                    meta = meta or {}
                     # Apply metadata filter post-query if needed
                     if metadata_filter:
                         match = all(meta.get(k) == v for k, v in metadata_filter.items())
@@ -310,7 +316,7 @@ class PgVectorStore(VectorStore):
                 return results
             finally:
                 session.close()
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to search pgvector")
             return []
 
@@ -336,7 +342,7 @@ class PgVectorStore(VectorStore):
                 return result.rowcount
             finally:
                 session.close()
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to delete from pgvector")
             return 0
 

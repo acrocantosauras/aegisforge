@@ -9,7 +9,7 @@ import pytest
 
 from aegisforge.domain.models import MCPServerConfig, MCPToolDefinition
 from aegisforge.mcp.adapter import MCPToolAdapter, MCPToolManager
-from aegisforge.mcp.client import MockMCPClient, MCPToolResult
+from aegisforge.mcp.client import MCPToolResult, MockMCPClient
 from aegisforge.tools.registry import ToolRegistry
 
 

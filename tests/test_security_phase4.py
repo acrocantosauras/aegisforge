@@ -5,11 +5,9 @@ and other security invariants.
 """
 from __future__ import annotations
 
-import json
-
 from aegisforge.security.validation import (
-    validate_document_upload,
     sanitize_filename,
+    validate_document_upload,
 )
 from aegisforge.workflows.checkpoint import _sanitize_state
 

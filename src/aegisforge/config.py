@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     # Evaluation Settings
     llm_critic_enabled: bool = Field(default=True)
 
+    # Rate Limiting Settings
+    rate_limit_enabled: bool = Field(default=False)
+    rate_limit_max_requests: int = Field(default=300)
+    rate_limit_window_seconds: int = Field(default=60)
+    rate_limit_auth_max_requests: int = Field(default=600)
+    rate_limit_exempt_paths: str = Field(default="/metrics,/api/v1/health,/docs,/redoc,/openapi.json")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

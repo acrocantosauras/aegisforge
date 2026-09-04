@@ -130,7 +130,7 @@ export class ApiClient {
       status: string;
       final_result: Record<string, unknown>;
       errors: string[];
-    }>(`/requests/${requestId}/execute`, { method: "POST", token });
+    }>(`/execution/requests/${requestId}/execute`, { method: "POST", token });
   }
 
   // Documents

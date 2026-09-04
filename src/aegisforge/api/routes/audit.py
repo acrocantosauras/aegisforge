@@ -1,33 +1,45 @@
 from __future__ import annotations
 
-import json
-
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from aegisforge.db.models import AuditEventModel
+from aegisforge.db.models import AuditEventModel, UserModel
 from aegisforge.db.session import get_db
 from aegisforge.domain.schemas import AuditEventRead
+from aegisforge.services.auth_service import get_current_user
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
 
+@router.get("", response_model=dict)
+def list_audit_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: UserModel = Depends(get_current_user),
+) -> dict:
+    """List audit events for the caller's organization (tenant-isolated)."""
+    events = (
+        db.query(AuditEventModel)
+        .filter(AuditEventModel.organization_id == user.organization_id)
+        .order_by(AuditEventModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"events": [AuditEventRead.model_validate(e) for e in events]}
+
+
 @router.get("/events", response_model=list[AuditEventRead])
-def list_audit_events(db: Session = Depends(get_db)) -> list[AuditEventModel]:
-    events = db.query(AuditEventModel).order_by(AuditEventModel.created_at.desc()).limit(20).all()
-    result = []
-    for event in events:
-        event_dict = {
-            "id": event.id,
-            "organization_id": event.organization_id,
-            "actor_id": event.actor_id,
-            "action": event.action,
-            "resource_type": event.resource_type,
-            "resource_id": event.resource_id,
-            "outcome": event.outcome,
-            "event_metadata": json.loads(event.event_metadata) if isinstance(event.event_metadata, str) else event.event_metadata,
-            "created_at": event.created_at,
-            "request_id": event.request_id,
-        }
-        result.append(event_dict)
-    return result
+def list_audit_events_legacy(
+    limit: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: UserModel = Depends(get_current_user),
+) -> list[AuditEventModel]:
+    """List audit events for the caller's organization (legacy path)."""
+    events = (
+        db.query(AuditEventModel)
+        .filter(AuditEventModel.organization_id == user.organization_id)
+        .order_by(AuditEventModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return events

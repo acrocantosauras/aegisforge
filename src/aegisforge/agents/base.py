@@ -10,6 +10,18 @@ from aegisforge.domain.models import (
     AgentResult,
     AgentType,
 )
+from aegisforge.observability.metrics import record_agent_execution
+
+
+def _record_agent_metric(agent_type: str, status: str, duration_ms: int) -> None:
+    """Record an agent execution metric (no-op if prometheus unavailable)."""
+    try:
+        record_agent_execution(agent_type, status, duration_ms)
+    except Exception as exc:
+        # Metrics must never break agent execution
+        import logging
+
+        logging.getLogger(__name__).debug("Failed to record agent metric: %s", exc)
 
 # --- Permission Model ---
 
@@ -83,17 +95,20 @@ class BaseAgent(ABC):
     def execute(self, input_data: dict[str, Any], context: AgentExecutionContext) -> AgentResult:
         """Execute the agent with full lifecycle tracking.
 
-        Subclasses override ``_execute``; this wrapper captures timing
-        and converts exceptions into failed AgentResults.
+        Subclasses override ``_execute``; this wrapper captures timing,
+        records Prometheus metrics, and converts exceptions into failed
+        AgentResults.
         """
         start = time.monotonic()
         try:
             result = self._execute(input_data, context)
             elapsed_ms = int((time.monotonic() - start) * 1000)
             result.execution_time_ms = elapsed_ms
+            _record_agent_metric(self.agent_type.value, result.status.value, elapsed_ms)
             return result
         except PermissionError as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
+            _record_agent_metric(self.agent_type.value, "denied", elapsed_ms)
             return AgentResult(
                 agent_name=self.name,
                 agent_type=self.agent_type,
@@ -104,6 +119,7 @@ class BaseAgent(ABC):
             )
         except Exception as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
+            _record_agent_metric(self.agent_type.value, "failed", elapsed_ms)
             return AgentResult(
                 agent_name=self.name,
                 agent_type=self.agent_type,

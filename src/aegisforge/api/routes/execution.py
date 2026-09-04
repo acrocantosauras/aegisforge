@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from aegisforge.config import Settings, get_settings
 from aegisforge.db.models import UserModel
-from aegisforge.db.session import get_db, get_session_factory
+from aegisforge.db.session import get_db
+from aegisforge.observability.metrics import record_queue_event, set_queue_depth
 from aegisforge.services.auth_service import get_current_user
 from aegisforge.services.execution_service import execute_request
 
@@ -44,18 +45,31 @@ def execute_request_route(
     request_id: str,
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     """Execute the full workflow for a request (synchronous).
 
     This triggers: validate → plan → execute → evaluate → complete/fail.
     Blocks until the workflow completes. Use for testing and internal use.
     """
+    # Tenant isolation: the request must belong to the caller's organization
+    from aegisforge.db.models import RequestModel
+
+    request = (
+        db.query(RequestModel)
+        .filter(RequestModel.id == request_id, RequestModel.organization_id == user.organization_id)
+        .first()
+    )
+    if request is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
+
     try:
         result = execute_request(
             db=db,
             request_id=request_id,
             user_id=user.id,
             organization_id=user.organization_id,
+            settings=settings,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
@@ -75,6 +89,7 @@ def execute_request_route(
 )
 def execute_request_async(
     request_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
@@ -84,16 +99,20 @@ def execute_request_async(
     F5: Submits the job to Redis/worker queue and returns immediately.
     The worker will process the workflow in the background.
     """
-    from aegisforge.db.models import RequestModel, ExecutionJobModel, WorkflowModel
     from aegisforge.async_execution.jobs import (
         InMemoryJobQueue,
         JobManager,
         RedisJobQueue,
     )
+    from aegisforge.db.models import ExecutionJobModel, RequestModel, WorkflowModel
 
-    # Verify request exists
-    request = db.query(RequestModel).filter(RequestModel.id == request_id).first()
-    if request is None:
+    # Verify request exists AND belongs to the caller's organization
+    request_row = (
+        db.query(RequestModel)
+        .filter(RequestModel.id == request_id, RequestModel.organization_id == user.organization_id)
+        .first()
+    )
+    if request_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
 
     workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
@@ -121,6 +140,9 @@ def execute_request_async(
     db.commit()
 
     # Submit to Redis queue
+    from aegisforge.async_execution.jobs import JobQueue as _JobQueue
+
+    queue: _JobQueue
     try:
         import redis as redis_lib
 
@@ -128,21 +150,25 @@ def execute_request_async(
         redis_client.ping()
         queue = RedisJobQueue(redis_client)
     except Exception:
-        from aegisforge.async_execution.jobs import InMemoryJobQueue
         queue = InMemoryJobQueue()
 
     job_manager = JobManager(queue)
     from aegisforge.domain.models import ExecutionJob, ExecutionJobStatus
 
+    trace_id = request.headers.get("x-request-id", "") or ""
     job = ExecutionJob(
         job_id=job_id,
         request_id=request_id,
         workflow_id=workflow_id,
+        organization_id=user.organization_id,
         status=ExecutionJobStatus.QUEUED,
         max_retries=settings.job_max_retries,
+        trace_id=trace_id,
     )
     job_manager._jobs[job_id] = job
     queue.enqueue(job)
+    record_queue_event("queued")
+    set_queue_depth(queue.size())
 
     return {
         "request_id": request_id,

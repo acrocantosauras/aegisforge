@@ -235,15 +235,28 @@ Copy `.env.example` to `.env` and configure:
 ## Testing
 
 ```bash
-# All tests (279 tests, ~4 seconds)
+# Unit tests (352 tests; integration tests are skipped unless enabled)
 pytest -v
 
 # With coverage
 pytest --cov=aegisforge --cov-report=term-missing
 
+# Real PostgreSQL + pgvector + Redis integration tests (requires services)
+docker compose up -d postgres redis
+AEGISFORGE_INTEGRATION_TESTS=true pytest -q tests/integration
+
+# Frontend tests
+cd frontend && npm test
+
 # Specific test file
 pytest tests/test_workflow.py -v
 ```
+
+> **Note:** The default `pytest` run reports `352 passed, 23 skipped`. The 23
+> skipped are real-infrastructure integration tests that only run with
+> `AEGISFORGE_INTEGRATION_TESTS=true` (23 passing when services are up). The
+> frontend suite adds 35 component/behavioral tests via `npm test`. Real-LLM
+> tests remain opt-in via `AEGISFORGE_REAL_LLM_TESTS=true` and are not run in CI.
 
 ### Test Categories
 
@@ -268,6 +281,15 @@ pytest tests/test_workflow.py -v
 | Checkpoint | `test_checkpoint.py` | 18 | Checkpointing, approval pause/resume, sanitization |
 | Security Phase 4 | `test_security_phase4.py` | 15 | Document security, prompt injection, tenant isolation, secrets |
 | E2E Phase 4 | `test_e2e_phase4.py` | 11 | Full RAG pipeline, async workflow, approval lifecycle, failure recovery |
+| Approval DB | `test_approval_db.py` | 18 | DB-backed approval persistence, decisions, expiry, tenant isolation |
+| Checkpoint DB | `test_checkpoint_db.py` | 8 | Durable DB checkpoint store, restart recovery |
+| Approval E2E | `test_approval_e2e.py` | 5 | API-level approval approve/reject/expire/unauthorized flow |
+| Metrics Exec | `test_metrics_execution.py` | 8 | Prometheus counters/histograms change on real execution |
+| Tracing | `test_tracing.py` | 6 | OTel tracing through execution path, failed spans |
+| Rate Limit | `test_rate_limit.py` | 4 | Redis-backed rate limiting, configurable limits |
+| Security 4.2 | `test_security_phase42.py` | 5 | Tenant isolation, authorization, secrets recheck |
+| Integration | `tests/integration/` | 23 | Real PostgreSQL/pgvector + Redis (opt-in via env flag) |
+| Frontend | `frontend/src/**/*.test.*` | 35 | API client, auth, login, dashboard, approvals, documents, requests |
 
 ## Documentation
 

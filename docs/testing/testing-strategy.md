@@ -168,7 +168,7 @@
 - Mock MCP client for tool integration testing
 - In-memory job queue for async execution testing
 - In-memory checkpoint store for workflow checkpointing testing
-- All 279 tests run in ~4 seconds
+- 352 unit tests pass; 23 real-infrastructure integration tests run opt-in via `AEGISFORGE_INTEGRATION_TESTS=true`; 35 frontend tests via `npm test`
 
 ## Phase 4 Test Additions
 
@@ -193,7 +193,7 @@
 ## Running Tests
 
 ```bash
-# All tests (279 tests)
+# All unit tests (352 tests; integration tests skipped unless enabled)
 python -m pytest tests/ -v
 
 # Specific test file

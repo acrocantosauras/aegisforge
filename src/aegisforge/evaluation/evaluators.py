@@ -12,8 +12,6 @@ from typing import Any
 from aegisforge.domain.models import (
     AgentResult,
     ExecutionPlan,
-    EvaluationResult,
-    EvaluationVerdict,
     RetrievalResult,
 )
 

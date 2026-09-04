@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -16,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
+
+from aegisforge.observability.metrics import track_llm_request
 
 logger = logging.getLogger(__name__)
 
@@ -240,42 +241,49 @@ class DeterministicModelProvider(ModelProvider):
         # Build a deterministic response based on message content
         last_message = messages[-1]["content"] if messages else ""
 
-        # Check response map
-        for key, response in self._response_map.items():
-            if key.lower() in last_message.lower():
-                return LLMResponse(
-                    content=response,
-                    model=model or "deterministic-fake",
-                    tokens_used=len(response.split()),
-                    latency_ms=10,
-                    finish_reason="stop",
-                )
+        resolved_model = model or "deterministic-fake"
 
-        # Default response: echo the intent with a structured plan
-        response = json.dumps(
-            {
-                "plan_id": f"plan-{uuid.uuid4().hex[:12]}",
-                "tasks": [
-                    {
-                        "task_id": f"task-{uuid.uuid4().hex[:12]}",
-                        "description": f"Investigate and address: {last_message[:200]}",
-                        "assigned_agent_type": "research",
-                        "dependencies": [],
-                        "expected_output_description": "Investigation result",
-                        "tool_permissions_required": ["knowledge.search"],
-                    }
-                ],
-            },
-            indent=2,
-        )
+        with track_llm_request(self.provider_name, resolved_model) as meta:
+            # Check response map
+            for key, response in self._response_map.items():
+                if key.lower() in last_message.lower():
+                    llm_response = LLMResponse(
+                        content=response,
+                        model=resolved_model,
+                        tokens_used=len(response.split()),
+                        latency_ms=10,
+                        finish_reason="stop",
+                    )
+                    meta["tokens"] = llm_response.tokens_used
+                    return llm_response
 
-        return LLMResponse(
-            content=response,
-            model=model or "deterministic-fake",
-            tokens_used=len(response.split()),
-            latency_ms=10,
-            finish_reason="stop",
-        )
+            # Default response: echo the intent with a structured plan
+            response = json.dumps(
+                {
+                    "plan_id": f"plan-{uuid.uuid4().hex[:12]}",
+                    "tasks": [
+                        {
+                            "task_id": f"task-{uuid.uuid4().hex[:12]}",
+                            "description": f"Investigate and address: {last_message[:200]}",
+                            "assigned_agent_type": "research",
+                            "dependencies": [],
+                            "expected_output_description": "Investigation result",
+                            "tool_permissions_required": ["knowledge.search"],
+                        }
+                    ],
+                },
+                indent=2,
+            )
+
+            llm_response = LLMResponse(
+                content=response,
+                model=resolved_model,
+                tokens_used=len(response.split()),
+                latency_ms=10,
+                finish_reason="stop",
+            )
+            meta["tokens"] = llm_response.tokens_used
+            return llm_response
 
 
 class OpenAIModelProvider(ModelProvider):
@@ -359,7 +367,11 @@ class OpenAIModelProvider(ModelProvider):
                 raw=data,
             )
 
-        return _retry_with_backoff(_call, self._retry_config, "openai")
+        resolved_model = model or "gpt-4o-mini"
+        with track_llm_request(self.provider_name, resolved_model) as meta:
+            result = _retry_with_backoff(_call, self._retry_config, "openai")
+            meta["tokens"] = result.tokens_used
+            return result
 
     def generate_structured(
         self,
@@ -427,7 +439,11 @@ class OpenAIModelProvider(ModelProvider):
                 raw=data,
             )
 
-        return _retry_with_backoff(_call, self._retry_config, "openai")
+        resolved_model = model or "gpt-4o-mini"
+        with track_llm_request(self.provider_name, resolved_model) as meta:
+            result = _retry_with_backoff(_call, self._retry_config, "openai")
+            meta["tokens"] = result.tokens_used
+            return result
 
 
 class AnthropicModelProvider(ModelProvider):
@@ -525,7 +541,11 @@ class AnthropicModelProvider(ModelProvider):
                 raw=data,
             )
 
-        return _retry_with_backoff(_call, self._retry_config, "anthropic")
+        resolved_model = model or "claude-sonnet-4-20250514"
+        with track_llm_request(self.provider_name, resolved_model) as meta:
+            result = _retry_with_backoff(_call, self._retry_config, "anthropic")
+            meta["tokens"] = result.tokens_used
+            return result
 
     def generate_structured(
         self,

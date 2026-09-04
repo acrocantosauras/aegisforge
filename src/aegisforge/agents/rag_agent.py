@@ -14,7 +14,6 @@ from aegisforge.domain.models import (
     AgentExecutionStatus,
     AgentResult,
     AgentType,
-    ToolCallRecord,
 )
 from aegisforge.rag.retrieval import RetrievalService
 

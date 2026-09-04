@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from aegisforge.domain.models import ToolExecutionStatus
 from aegisforge.tools.base import BaseTool, ToolDefinition, ToolExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ class ToolRegistry:
         tool = self._tools.get(tool_name)
         if tool is None:
             return ToolExecutionResult(
-                status="failed",
+                status=ToolExecutionStatus.FAILED,
                 error=f"Tool '{tool_name}' not found in registry",
                 tool_name=tool_name,
             )

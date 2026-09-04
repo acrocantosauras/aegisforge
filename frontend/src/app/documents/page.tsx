@@ -132,8 +132,9 @@ export default function DocumentsPage() {
           )}
 
           <div className="form-group">
-            <label>Title (optional)</label>
+            <label htmlFor="uploadTitle">Title (optional)</label>
             <input
+              id="uploadTitle"
               type="text"
               value={uploadTitle}
               onChange={(e) => setUploadTitle(e.target.value)}
@@ -142,7 +143,13 @@ export default function DocumentsPage() {
           </div>
 
           <div className="form-group">
-            <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt,.md" />
+            <label htmlFor="documentFile">File</label>
+            <input
+              id="documentFile"
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,.docx,.txt,.md"
+            />
           </div>
 
           <button

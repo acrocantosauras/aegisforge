@@ -93,6 +93,9 @@ class PlannerAgent(BaseAgent):
             for kw in ["research", "find", "search", "investigate", "summarize", "review", "policy", "guidance", "lookup"]
         )
 
+        # Risk classification: high-risk intents require human approval
+        risk_level = _classify_risk(intent_lower)
+
         if needs_research:
             task_id = f"task-{uuid.uuid4().hex[:12]}"
             tasks.append(
@@ -104,6 +107,7 @@ class PlannerAgent(BaseAgent):
                     dependencies=[],
                     expected_output_description="Structured research result with evidence and sources",
                     tool_permissions_required=["knowledge.search"],
+                    risk_level=risk_level,
                 )
             )
 
@@ -119,6 +123,7 @@ class PlannerAgent(BaseAgent):
                     dependencies=[],
                     expected_output_description="Investigation result",
                     tool_permissions_required=["knowledge.search"],
+                    risk_level=risk_level,
                 )
             )
 
@@ -127,3 +132,19 @@ class PlannerAgent(BaseAgent):
             request_id=context.request_id,
             tasks=tasks,
         )
+
+
+def _classify_risk(intent_lower: str) -> str:
+    """Classify intent risk level using conservative keyword rules.
+
+    High-risk keywords gate the task behind human approval.
+    """
+    high_risk_keywords = [
+        "restart", "deploy", "delete", "destroy", "terminate", "shutdown",
+        "drop", "remove", "purge", "firewall", "credential", "password",
+        "payment", "transfer", "migrate", "config change", "reconfigure",
+        "downgrade", "revoke", "ban", "block", "disable", "wipe", "reset",
+    ]
+    if any(kw in intent_lower for kw in high_risk_keywords):
+        return "high"
+    return "low"

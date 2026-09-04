@@ -5,14 +5,18 @@ Uses Redis for queue backing with database persistence for state recovery.
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from aegisforge.domain.models import ExecutionJob, ExecutionJobStatus
+from aegisforge.observability.metrics import (
+    record_job_duration,
+    record_queue_event,
+    set_queue_depth,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +76,7 @@ class RedisJobQueue(JobQueue):
             job_data = job.model_dump_json()
             self._redis.lpush(self._queue_name, job_data)
             return True
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to enqueue job %s", job.job_id)
             return False
 
@@ -82,7 +86,7 @@ class RedisJobQueue(JobQueue):
             if data:
                 return ExecutionJob.model_validate_json(data)
             return None
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to dequeue job")
             return None
 
@@ -110,6 +114,7 @@ class JobManager:
         organization_id: str = "",
         max_retries: int = 3,
         idempotency_key: str = "",
+        trace_id: str = "",
     ) -> ExecutionJob:
         """Submit a new execution job to the queue."""
         # Check idempotency
@@ -126,13 +131,17 @@ class JobManager:
             job_id=f"job-{uuid.uuid4().hex[:12]}",
             request_id=request_id,
             workflow_id=workflow_id,
+            organization_id=organization_id,
             status=ExecutionJobStatus.QUEUED,
             max_retries=max_retries,
             idempotency_key=idempotency_key or f"job-{uuid.uuid4().hex[:16]}",
+            trace_id=trace_id,
         )
 
         self._jobs[job.job_id] = job
         self._queue.enqueue(job)
+        record_queue_event("queued")
+        set_queue_depth(self._queue.size())
 
         logger.info(
             "Submitted job %s for request %s (workflow %s)",
@@ -161,8 +170,7 @@ class JobManager:
         job.status = status
         if result is not None:
             job.result = result
-        if error is not None:
-            if error not in job.errors:
+        if error is not None and error not in job.errors:
                 job.errors.append(error)
 
         if status == ExecutionJobStatus.RUNNING and job.retry_count == 0:
@@ -213,6 +221,7 @@ class JobManager:
         if job.status in (ExecutionJobStatus.COMPLETED, ExecutionJobStatus.FAILED):
             return None
         job.status = ExecutionJobStatus.CANCELLED
+        record_queue_event("cancelled")
         return job
 
     def list_jobs(
@@ -245,12 +254,15 @@ class JobWorker:
         job = self._job_manager._queue.dequeue()
         if job is None:
             return None
+        set_queue_depth(self._job_manager._queue.size())
+        start_time = time.monotonic()
 
         # Update to running
         self._job_manager.update_job_status(
             job.job_id, ExecutionJobStatus.RUNNING
         )
         job.status = ExecutionJobStatus.RUNNING
+        record_queue_event("running")
 
         try:
             result = self._job_handler(job)
@@ -261,6 +273,8 @@ class JobWorker:
             )
             job.status = ExecutionJobStatus.COMPLETED
             job.result = result
+            record_queue_event("completed")
+            record_job_duration("completed", time.monotonic() - start_time)
             logger.info("Job %s completed successfully", job.job_id)
         except Exception as exc:
             logger.exception("Job %s failed", job.job_id)
@@ -271,10 +285,19 @@ class JobWorker:
             )
             job.status = ExecutionJobStatus.FAILED
             job.errors.append(str(exc))
+            record_queue_event("failed")
+            record_job_duration("failed", time.monotonic() - start_time)
 
             # Try to requeue for retry
             if self._job_manager.should_retry(job):
-                self._job_manager.requeue_for_retry(job.job_id)
+                requeued = self._job_manager.requeue_for_retry(job.job_id)
+                if requeued is not None:
+                    # The manager's record is authoritative — sync the local
+                    # (possibly Redis-deserialized) copy so callers observe
+                    # the retry state.
+                    job.status = requeued.status
+                    job.retry_count = requeued.retry_count
+                    record_queue_event("retried")
 
         return job
 

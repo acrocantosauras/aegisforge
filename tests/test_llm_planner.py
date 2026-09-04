@@ -5,13 +5,11 @@ malformed plans, unauthorized plans, circular dependencies, and model failure.
 """
 from __future__ import annotations
 
-import json
-
 from aegisforge.agents.base import AgentExecutionContext, PermissionSpec
 from aegisforge.agents.llm_planner import (
     LLMPlannerAgent,
-    validate_plan,
     _compute_depth,
+    validate_plan,
 )
 from aegisforge.domain.models import (
     AgentExecutionStatus,

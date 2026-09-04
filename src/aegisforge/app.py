@@ -13,13 +13,13 @@ from aegisforge.api.routes.execution import router as execution_router
 from aegisforge.api.routes.health import router as health_router
 from aegisforge.api.routes.requests import router as requests_router
 from aegisforge.config import Settings, get_settings
+from aegisforge.config import get_settings as _get_settings
 from aegisforge.db.session import get_db, get_session_factory
 from aegisforge.logging_config import configure_logging
 from aegisforge.observability.metrics import (
+    HAS_PROMETHEUS,
     get_metrics,
     get_metrics_content_type,
-    HAS_PROMETHEUS,
-    track_http_request,
 )
 
 
@@ -47,6 +47,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.dependency_overrides[get_db] = get_db_override
 
+    # Override get_settings so ALL routes use the injected settings
+    # (token signing, rate limits, approval timeouts, etc.)
+    app.dependency_overrides[_get_settings] = lambda: settings
+
     # F11: CORS — configurable origins, no wildcard for authenticated usage
     cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
@@ -56,6 +60,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Rate limiting (Redis-backed; disabled by default for dev)
+    from aegisforge.security.rate_limit import RateLimitMiddleware
+
+    app.add_middleware(RateLimitMiddleware, settings=settings)
 
     @app.middleware("http")
     async def add_request_id(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -77,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         duration = __import__("time").monotonic() - start_time
 
         if HAS_PROMETHEUS:
-            from aegisforge.observability.metrics import HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION
+            from aegisforge.observability.metrics import HTTP_REQUEST_DURATION, HTTP_REQUESTS_TOTAL
 
             # Normalize path to avoid high cardinality labels
             normalized_path = _normalize_path(path)

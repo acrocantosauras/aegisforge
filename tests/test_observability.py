@@ -5,10 +5,9 @@ from aegisforge.observability.tracing import (
     ExecutionMetrics,
     MetricsCollector,
     Tracer,
-    reset_metrics_collector,
     get_metrics_collector,
+    reset_metrics_collector,
 )
-
 
 # --- Tracer Tests ---
 

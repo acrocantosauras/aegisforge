@@ -9,18 +9,15 @@ Tests:
 """
 from __future__ import annotations
 
-import uuid
-
 from aegisforge.approval.service import ApprovalService, is_approval_required
 from aegisforge.domain.models import (
     ApprovalStatus,
     RiskLevel,
-    RequestStatus,
 )
 from aegisforge.workflows.checkpoint import (
     InMemoryCheckpointStore,
-    WorkflowCheckpointer,
     WorkflowCheckpoint,
+    WorkflowCheckpointer,
     _sanitize_state,
 )
 
@@ -277,7 +274,6 @@ class TestApprovalIntegration:
         assert result.status == ApprovalStatus.REJECTED
 
     def test_approval_expiry(self):
-        from datetime import UTC, datetime, timedelta
 
         service = ApprovalService(approval_timeout_hours=-1)  # Already expired
 

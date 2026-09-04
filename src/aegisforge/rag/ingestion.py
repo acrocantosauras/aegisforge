@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,9 +35,9 @@ def extract_text_from_pdf(content: bytes, filename: str = "") -> str:
     a proper PDF library (e.g., pymupdf, pdfplumber).
     """
     try:
+        import os
         import subprocess
         import tempfile
-        import os
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp.write(content)
@@ -49,6 +50,7 @@ def extract_text_from_pdf(content: bytes, filename: str = "") -> str:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                check=False,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout
@@ -56,8 +58,8 @@ def extract_text_from_pdf(content: bytes, filename: str = "") -> str:
             pass
         finally:
             os.unlink(tmp_path)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("PDF text extraction failed (using fallback): %s", exc)
 
     # Fallback: return a placeholder
     return f"[PDF content from {filename or 'unknown'} — text extraction not available]"
@@ -66,8 +68,9 @@ def extract_text_from_pdf(content: bytes, filename: str = "") -> str:
 def extract_text_from_docx(content: bytes, filename: str = "") -> str:
     """Extract text from DOCX content."""
     try:
-        from docx import Document
         import io
+
+        from docx import Document
 
         doc = Document(io.BytesIO(content))
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -78,7 +81,7 @@ def extract_text_from_docx(content: bytes, filename: str = "") -> str:
         return f"[DOCX content from {filename or 'unknown'} — extraction failed]"
 
 
-EXTRACTORS: dict[str, callable] = {
+EXTRACTORS: dict[str, Callable[..., str]] = {
     "text/plain": extract_text_from_plain,
     "text/markdown": extract_text_from_markdown,
     "application/pdf": extract_text_from_pdf,

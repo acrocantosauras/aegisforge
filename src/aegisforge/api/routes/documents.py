@@ -7,22 +7,21 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from aegisforge.config import Settings, get_settings
-from aegisforge.db.models import DocumentModel, DocumentChunkModel, UserModel
-from aegisforge.db.session import get_db
+from aegisforge.db.models import DocumentChunkModel, DocumentModel, UserModel
+from aegisforge.db.session import get_db, get_session_factory
 from aegisforge.rag.embeddings import get_embedding_provider
 from aegisforge.rag.ingestion import ingest_document
 from aegisforge.rag.vector_store import VectorStoreEntry, get_vector_store
 from aegisforge.security.validation import (
-    validate_document_upload,
     sanitize_filename,
-    ALLOWED_CONTENT_TYPES,
+    validate_document_upload,
 )
 from aegisforge.services.auth_service import get_current_user
 
@@ -199,7 +198,7 @@ def list_documents(
         .all()
     )
     return DocumentListResponse(
-        documents=documents,
+        documents=[DocumentRead.model_validate(d) for d in documents],
         total=total,
         page=page,
         page_size=page_size,
@@ -248,8 +247,8 @@ def delete_document(
             dimension=settings.embedding_dimension,
         )
         vector_store.delete_by_document(document_id, user.organization_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Failed to delete from vector store: %s", exc)
 
     # Delete document
     db.delete(doc)

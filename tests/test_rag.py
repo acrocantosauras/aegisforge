@@ -27,7 +27,6 @@ from aegisforge.rag.vector_store import (
     _cosine_similarity,
 )
 
-
 # --- Embedding Tests ---
 
 

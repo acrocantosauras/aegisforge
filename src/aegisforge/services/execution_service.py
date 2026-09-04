@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from aegisforge.config import Settings, get_settings, get_model_provider_from_settings
+from aegisforge.config import Settings, get_model_provider_from_settings, get_settings
 from aegisforge.db.models import (
     AgentExecutionModel,
     RequestModel,
@@ -30,11 +30,12 @@ def _build_dependencies(settings: Settings | None = None):  # type: ignore[no-un
     model_provider = get_model_provider_from_settings(settings)
 
     retrieval_service = None
+    is_production = settings.environment not in ("development", "test", "")
     try:
+        from aegisforge.db.session import get_session_factory as _gsf
         from aegisforge.rag.embeddings import get_embedding_provider
         from aegisforge.rag.retrieval import RetrievalService
         from aegisforge.rag.vector_store import get_vector_store
-        from aegisforge.db.session import get_session_factory as _gsf
 
         embedding_provider = get_embedding_provider(
             settings.embedding_provider,
@@ -53,9 +54,41 @@ def _build_dependencies(settings: Settings | None = None):  # type: ignore[no-un
             vector_store=vector_store,
         )
     except Exception as exc:
+        if is_production and settings.database_url.startswith("postgresql"):
+            logger.critical(
+                "PostgreSQL/pgvector required in production but failed to "
+                "initialize: %s", exc,
+            )
+            raise
         logger.warning("Could not create retrieval service: %s", exc)
 
     return model_provider, retrieval_service
+
+
+def _create_execution_job_record(
+    db: Session,
+    request_id: str,
+    workflow_id: str,
+    organization_id: str,
+    status: str = "running",
+) -> str:
+    """Create an ExecutionJobModel row so approvals can reference a real job."""
+    from aegisforge.db.models import ExecutionJobModel
+
+    job_id = f"job-{uuid.uuid4().hex[:12]}"
+    db.add(
+        ExecutionJobModel(
+            id=job_id,
+            request_id=request_id,
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            status=status,
+            retry_count=0,
+            max_retries=3,
+        )
+    )
+    db.commit()
+    return job_id
 
 
 def execute_request(
@@ -63,17 +96,25 @@ def execute_request(
     request_id: str,
     user_id: str,
     organization_id: str,
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Execute a full workflow for a request.
 
     This orchestrates: validate → plan → execute → evaluate → complete/fail.
     Returns the final workflow state.
     """
-    from aegisforge.workflows.checkpoint import WorkflowCheckpointer, get_checkpoint_store
+    from aegisforge.approval.service import ApprovalService
+    from aegisforge.workflows.checkpoint import WorkflowCheckpointer, get_db_checkpoint_store
     from aegisforge.workflows.langgraph_workflow import execute_workflow
 
-    # Fetch the request
-    request = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+    settings = settings or get_settings()
+
+    # Fetch the request (tenant-isolated)
+    request = (
+        db.query(RequestModel)
+        .filter(RequestModel.id == request_id, RequestModel.organization_id == organization_id)
+        .first()
+    )
     if request is None:
         raise ValueError(f"Request {request_id} not found")
 
@@ -103,15 +144,23 @@ def execute_request(
     db.add(workflow_model)
     db.commit()
 
-    # Build dependencies
-    model_provider, retrieval_service = _build_dependencies()
+    # Create a job record so approvals have a valid job FK
+    job_id = _create_execution_job_record(db, request_id, workflow_id, organization_id)
 
-    # Create checkpointer
+    # Build dependencies
+    model_provider, retrieval_service = _build_dependencies(settings)
+    approval_service = ApprovalService(
+        session_factory=lambda: db,
+        approval_timeout_hours=settings.approval_timeout_hours,
+    )
+
+    # Durable (DB-backed) checkpoint store
+    checkpoint_store = get_db_checkpoint_store(settings)
     checkpointer = WorkflowCheckpointer(
         workflow_id=workflow_id,
         request_id=request_id,
         organization_id=organization_id,
-        store=get_checkpoint_store(),
+        store=checkpoint_store,
     )
 
     try:
@@ -125,6 +174,8 @@ def execute_request(
             checkpointer=checkpointer,
             model_provider=model_provider,
             retrieval_service=retrieval_service,
+            approval_service=approval_service,
+            job_id=job_id,
         )
 
         # Persist agent executions
@@ -136,8 +187,39 @@ def execute_request(
         # Persist workflow tasks
         _persist_tasks(db, request_id, final_state)
 
+        # Update the job record with the final state
+        _update_job_record(db, job_id, final_state)
+
         # Determine final status
         final_status = final_state.get("status", "failed")
+        if final_status == RequestStatus.ACTION_REQUIRES_APPROVAL.value:
+            # Workflow paused for human approval — record the paused state
+            update_request_status(db, request_id, RequestStatus.ACTION_REQUIRES_APPROVAL)
+            record_audit_event(
+                db,
+                organization_id=organization_id,
+                actor_id=user_id,
+                action="workflow.paused_for_approval",
+                resource_type="request",
+                resource_id=request_id,
+                outcome="success",
+                metadata={
+                    "final_status": final_status,
+                    "workflow_id": workflow_id,
+                    "approval_id": final_state.get("approval_id", ""),
+                },
+                request_id=request_id,
+            )
+            return {
+                "request_id": request_id,
+                "workflow_id": workflow_id,
+                "job_id": job_id,
+                "status": final_status,
+                "approval_id": final_state.get("approval_id", ""),
+                "final_result": {},
+                "errors": [],
+            }
+
         try:
             status_enum = RequestStatus(final_status)
         except ValueError:
@@ -161,6 +243,7 @@ def execute_request(
         return {
             "request_id": request_id,
             "workflow_id": workflow_id,
+            "job_id": job_id,
             "status": final_status,
             "final_result": final_state.get("final_result", {}),
             "errors": final_state.get("errors", []),
@@ -185,9 +268,141 @@ def execute_request(
         return {
             "request_id": request_id,
             "workflow_id": workflow_id,
+            "job_id": job_id,
             "status": "failed",
             "errors": [str(exc)],
         }
+
+
+def _update_job_record(db: Session, job_id: str, final_state: dict[str, Any]) -> None:
+    """Persist final job status/result to the ExecutionJobModel row."""
+    from aegisforge.db.models import ExecutionJobModel
+
+    job_model = db.query(ExecutionJobModel).filter(ExecutionJobModel.id == job_id).first()
+    if job_model is None:
+        return
+    final_status = final_state.get("status", "failed")
+    if final_status == RequestStatus.ACTION_REQUIRES_APPROVAL.value:
+        job_model.status = "waiting_for_approval"
+    else:
+        job_model.status = "completed" if final_status == RequestStatus.COMPLETED.value else "failed"
+    job_model.result_json = json.dumps(
+        {
+            "status": final_status,
+            "final_result": final_state.get("final_result", {}),
+            "errors": final_state.get("errors", []),
+        }
+    )
+    db.commit()
+
+
+def resume_request_after_approval(
+    db: Session,
+    request_id: str,
+    workflow_id: str,
+    approval_decision: str,
+    approval_id: str = "",
+    reviewer_id: str = "",
+    organization_id: str = "",
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Resume a paused workflow after an approval decision.
+
+    approved → continue the workflow from its checkpoint.
+    rejected → mark the request failed; the protected action never executes.
+    """
+    from aegisforge.approval.service import ApprovalService
+    from aegisforge.workflows.checkpoint import WorkflowCheckpointer, get_db_checkpoint_store
+    from aegisforge.workflows.langgraph_workflow import execute_workflow
+
+    settings = settings or get_settings()
+
+    request = (
+        db.query(RequestModel)
+        .filter(RequestModel.id == request_id, RequestModel.organization_id == organization_id)
+        .first()
+    )
+    if request is None:
+        raise ValueError(f"Request {request_id} not found")
+
+    if approval_decision == "rejected":
+        update_request_status(db, request_id, RequestStatus.FAILED)
+        record_audit_event(
+            db,
+            organization_id=organization_id,
+            actor_id=reviewer_id,
+            action="workflow.rejected_by_approval",
+            resource_type="request",
+            resource_id=request_id,
+            outcome="failure",
+            metadata={"approval_id": approval_id, "workflow_id": workflow_id},
+            request_id=request_id,
+        )
+        return {
+            "request_id": request_id,
+            "workflow_id": workflow_id,
+            "status": RequestStatus.FAILED.value,
+            "errors": [f"Approval {approval_id} rejected by {reviewer_id}"],
+            "final_result": {},
+        }
+
+    model_provider, retrieval_service = _build_dependencies(settings)
+    approval_service = ApprovalService(
+        session_factory=lambda: db,
+        approval_timeout_hours=settings.approval_timeout_hours,
+    )
+    checkpoint_store = get_db_checkpoint_store(settings)
+    checkpointer = WorkflowCheckpointer(
+        workflow_id=workflow_id,
+        request_id=request_id,
+        organization_id=organization_id,
+        store=checkpoint_store,
+    )
+
+    final_state = execute_workflow(
+        request_id=request_id,
+        intent=request.intent,
+        user_id=request.requested_by,
+        organization_id=organization_id,
+        workflow_id=workflow_id,
+        checkpointer=checkpointer,
+        resume_from_checkpoint=True,
+        model_provider=model_provider,
+        retrieval_service=retrieval_service,
+        approval_service=approval_service,
+        job_id="",
+    )
+
+    _persist_agent_executions(db, request_id, final_state)
+    _persist_tool_executions(db, request_id, final_state)
+    _persist_tasks(db, request_id, final_state)
+
+    final_status = final_state.get("status", "failed")
+    try:
+        status_enum = RequestStatus(final_status)
+    except ValueError:
+        status_enum = RequestStatus.COMPLETED
+    update_request_status(db, request_id, status_enum)
+
+    record_audit_event(
+        db,
+        organization_id=organization_id,
+        actor_id=reviewer_id or request.requested_by,
+        action="workflow.resumed_after_approval",
+        resource_type="request",
+        resource_id=request_id,
+        outcome="success" if status_enum == RequestStatus.COMPLETED else "failure",
+        metadata={"approval_id": approval_id, "workflow_id": workflow_id, "final_status": final_status},
+        request_id=request_id,
+    )
+
+    return {
+        "request_id": request_id,
+        "workflow_id": workflow_id,
+        "status": final_status,
+        "final_result": final_state.get("final_result", {}),
+        "errors": final_state.get("errors", []),
+    }
 
 
 def _persist_agent_executions(
@@ -227,12 +442,16 @@ def _persist_tool_executions(
 
 
 def _persist_tasks(db: Session, request_id: str, state: dict[str, Any]) -> None:
-    """Persist task records from the execution plan."""
+    """Persist task records from the execution plan (idempotent)."""
     plan = state.get("plan", {})
     tasks = plan.get("tasks", [])
     for task_dict in tasks:
+        task_id = task_dict.get("task_id", "")
+        # Idempotent: skip tasks already persisted (e.g. resume after approval)
+        if task_id and db.query(TaskModel).filter(TaskModel.id == task_id).first() is not None:
+            continue
         task = TaskModel(
-            id=task_dict.get("task_id", str(uuid.uuid4())),
+            id=task_id or str(uuid.uuid4()),
             request_id=request_id,
             title=task_dict.get("description", "")[:255],
             description=task_dict.get("description", ""),

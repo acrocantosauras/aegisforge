@@ -162,7 +162,7 @@ class DocumentModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC), nullable=False)
 
-    chunks: Mapped[list["DocumentChunkModel"]] = relationship(back_populates="document")
+    chunks: Mapped[list[DocumentChunkModel]] = relationship(back_populates="document")
 
 
 class DocumentChunkModel(Base):
@@ -222,3 +222,16 @@ class ApprovalRequestModel(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     job: Mapped[ExecutionJobModel] = relationship()
+
+
+class WorkflowCheckpointModel(Base):
+    __tablename__ = "workflow_checkpoints"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    workflow_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    organization_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    user_id: Mapped[str] = mapped_column(String(64), default="")
+    node_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    state_json: Mapped[str] = mapped_column("state", Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)

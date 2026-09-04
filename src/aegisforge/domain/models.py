@@ -181,13 +181,6 @@ class Document(EntityModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class RetrievalResult(BaseModel):
-    document_id: str
-    score: float
-    snippet: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
 class Evaluation(EntityModel):
     request_id: str
     quality_score: float | None = None
@@ -219,6 +212,7 @@ class ExecutionPlanTask(BaseModel):
     dependencies: list[str] = Field(default_factory=list)
     expected_output_description: str = ""
     tool_permissions_required: list[str] = Field(default_factory=list)
+    risk_level: str = "low"  # low, medium, high, critical — gates human approval
 
 
 class ExecutionPlan(BaseModel):
@@ -342,12 +336,16 @@ class ExecutionJob(BaseModel):
     job_id: str
     request_id: str
     workflow_id: str
+    organization_id: str = ""
     status: ExecutionJobStatus = ExecutionJobStatus.QUEUED
     retry_count: int = 0
     max_retries: int = 3
     result: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     idempotency_key: str = ""
+    trace_id: str = ""
+    resume: bool = False
+    approval_decision: str = ""
 
 
 class ApprovalRequest(BaseModel):

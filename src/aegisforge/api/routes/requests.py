@@ -22,6 +22,22 @@ def create_request_route(
     return request
 
 
+@router.get("", response_model=list[RequestRead])
+def list_requests_route(
+    db: Session = Depends(get_db),
+    user: UserModel = Depends(get_current_user),
+) -> list[RequestModel]:
+    """List requests for the user's organization (tenant-isolated)."""
+    requests = (
+        db.query(RequestModel)
+        .filter(RequestModel.organization_id == user.organization_id)
+        .order_by(RequestModel.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return requests
+
+
 @router.get("/{request_id}", response_model=RequestRead)
 def get_request_route(
     request_id: str,

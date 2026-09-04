@@ -7,29 +7,22 @@ Scenario D: Failure recovery (failure → checkpoint → retry → resume)
 """
 from __future__ import annotations
 
-import uuid
-
-from aegisforge.agents.base import AgentExecutionContext, PermissionSpec
-from aegisforge.agents.research_agent import ResearchAgent
 from aegisforge.approval.service import ApprovalService, execute_safe_action
+from aegisforge.async_execution.jobs import InMemoryJobQueue, JobManager, JobWorker
 from aegisforge.domain.models import (
     ApprovalStatus,
-    RiskLevel,
-    RequestStatus,
     ExecutionJobStatus,
+    RequestStatus,
+    RiskLevel,
 )
 from aegisforge.rag.embeddings import DeterministicEmbeddingProvider
 from aegisforge.rag.ingestion import ingest_document
 from aegisforge.rag.retrieval import RetrievalService
 from aegisforge.rag.vector_store import InMemoryVectorStore, VectorStoreEntry
-from aegisforge.tools.registry import ToolRegistry
-from aegisforge.tools.knowledge_tool import KnowledgeSearchTool
-from aegisforge.async_execution.jobs import InMemoryJobQueue, JobManager, JobWorker
 from aegisforge.workflows.checkpoint import (
     InMemoryCheckpointStore,
     WorkflowCheckpointer,
 )
-from aegisforge.workflows.langgraph_workflow import execute_workflow
 
 
 class TestScenarioA_KnowledgePipeline:
@@ -179,7 +172,7 @@ class TestScenarioB_AsyncWorkflow:
         queue = InMemoryJobQueue()
         manager = JobManager(queue)
 
-        job = manager.submit_job(
+        manager.submit_job(
             request_id="req-retry",
             workflow_id="wf-retry",
             max_retries=2,
@@ -390,7 +383,7 @@ class TestScenarioD_FailureRecovery:
         queue = InMemoryJobQueue()
         manager = JobManager(queue)
 
-        job = manager.submit_job(
+        manager.submit_job(
             request_id="req-worker-crash",
             workflow_id="wf-worker-crash",
             max_retries=2,

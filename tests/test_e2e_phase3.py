@@ -19,14 +19,14 @@ from aegisforge.domain.models import (
     AgentExecutionStatus,
     ApprovalStatus,
     ExecutionJobStatus,
-    PlannerType,
+    MCPServerConfig,
+    MCPToolDefinition,
     RiskLevel,
 )
 from aegisforge.evaluation.evaluators import evaluate_plan, evaluate_rag_result
 from aegisforge.llm.providers import DeterministicModelProvider
 from aegisforge.mcp.adapter import MCPToolManager
-from aegisforge.mcp.client import MockMCPClient, MCPToolResult
-from aegisforge.domain.models import MCPToolDefinition, MCPServerConfig
+from aegisforge.mcp.client import MCPToolResult, MockMCPClient
 from aegisforge.observability.tracing import Tracer
 from aegisforge.rag.embeddings import DeterministicEmbeddingProvider
 from aegisforge.rag.ingestion import ingest_document
@@ -150,7 +150,7 @@ def test_scenario_a_knowledge_question_rag() -> None:
     assert summary["total_duration_ms"] >= 0
 
     # Verify tenant isolation
-    other_context = _make_context(org_id="org-other")
+    _make_context(org_id="org-other")
     other_rag_result = rag_agent.execute(
         {
             "query": "What is the support escalation policy?",
@@ -251,7 +251,7 @@ def test_scenario_b_tool_assisted_research_mcp() -> None:
         plan_data = plan_result.result
 
         # Validate the plan
-        from aegisforge.domain.models import ExecutionPlan, ExecutionPlanTask, AgentType
+        from aegisforge.domain.models import ExecutionPlan, ExecutionPlanTask
 
         tasks = [
             ExecutionPlanTask(**t) for t in plan_data.get("tasks", [])
@@ -490,7 +490,7 @@ def test_full_pipeline_with_async_execution() -> None:
     worker = JobWorker(job_manager, workflow_handler)
 
     # Submit and process
-    job = job_manager.submit_job(
+    job_manager.submit_job(
         request_id="req-async-rag",
         workflow_id="wf-async-rag",
         organization_id="org-e2e",

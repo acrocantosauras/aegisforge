@@ -134,8 +134,9 @@ export default function ApprovalsPage() {
                 {approval.status === "pending" && (
                   <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, marginTop: 8 }}>
                     <div className="form-group">
-                      <label>Decision Reason</label>
+                      <label htmlFor={`reason-${approval.approval_id}`}>Decision Reason</label>
                       <input
+                        id={`reason-${approval.approval_id}`}
                         type="text"
                         value={decisionReason[approval.approval_id] || ""}
                         onChange={(e) =>

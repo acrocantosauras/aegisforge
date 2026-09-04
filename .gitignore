@@ -35,6 +35,8 @@ node_modules/
 out/
 dist/
 npm-debug.log*
+tsconfig.tsbuildinfo
+next-env.d.ts
 
 # --- OS / editor ---
 .DS_Store

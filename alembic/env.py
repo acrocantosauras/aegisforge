@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from aegisforge.db.base import Base
-from aegisforge.db.models import *  # noqa: F401,F403
+from aegisforge.db.models import *
+from alembic import context
 
 config = context.config
 if config.config_file_name is not None:

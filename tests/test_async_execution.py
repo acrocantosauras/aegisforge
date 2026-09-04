@@ -5,15 +5,12 @@ duplicate execution prevention, and idempotency.
 """
 from __future__ import annotations
 
-import pytest
-
 from aegisforge.async_execution.jobs import (
     InMemoryJobQueue,
     JobManager,
     JobWorker,
 )
 from aegisforge.domain.models import ExecutionJobStatus
-
 
 # --- Job Queue Tests ---
 
@@ -251,7 +248,7 @@ def test_worker_retries_on_failure() -> None:
         return {"result": "recovered"}
 
     worker = JobWorker(manager, handler)
-    job = manager.submit_job(request_id="req-1", workflow_id="wf-1", max_retries=3)
+    manager.submit_job(request_id="req-1", workflow_id="wf-1", max_retries=3)
 
     # First attempt fails and gets requeued
     processed = worker.process_next_job()

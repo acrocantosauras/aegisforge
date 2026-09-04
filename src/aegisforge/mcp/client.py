@@ -146,7 +146,7 @@ class StdioMCPClient(MCPClient):
             self._connected[server_config.server_id] = True
             logger.info("Connected to MCP server: %s", server_config.server_id)
             return True
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to connect to MCP server %s", server_config.server_id)
             return False
 
@@ -277,7 +277,7 @@ class StdioMCPClient(MCPClient):
 
             line = process.stdout.readline()
             return json.loads(line) if line else None
-        except Exception as exc:
+        except Exception:
             logger.exception("MCP communication error with %s", server_id)
             return None
 

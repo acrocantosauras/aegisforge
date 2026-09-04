@@ -14,7 +14,6 @@ from aegisforge.approval.service import (
 )
 from aegisforge.domain.models import ApprovalStatus, RiskLevel
 
-
 # --- Approval Service Tests ---
 
 
@@ -112,7 +111,6 @@ def test_cancel_approval() -> None:
 
 
 def test_approval_expiry() -> None:
-    from datetime import timedelta
     service = ApprovalService(approval_timeout_hours=24)
     approval = service.create_approval_request(
         job_id="job-1", request_id="req-1", workflow_id="wf-1",

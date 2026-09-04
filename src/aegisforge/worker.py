@@ -6,20 +6,19 @@ Supports graceful shutdown and health checks.
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import sys
 import time
 from typing import Any
 
-from aegisforge.config import get_settings, Settings, get_model_provider_from_settings
-from aegisforge.db.session import get_session_factory
 from aegisforge.async_execution.jobs import (
     InMemoryJobQueue,
     JobManager,
     JobWorker,
     RedisJobQueue,
 )
+from aegisforge.config import Settings, get_model_provider_from_settings, get_settings
+from aegisforge.db.session import get_session_factory
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +34,10 @@ def _handle_signal(signum: int, frame: Any) -> None:
 
 def _create_job_handler(settings: Settings) -> Any:
     """Create the job handler that executes workflows."""
+    from aegisforge.approval.service import ApprovalService
+    from aegisforge.domain.models import ExecutionJobStatus, RequestStatus
     from aegisforge.services.audit_service import record_audit_event
     from aegisforge.services.request_service import update_request_status
-    from aegisforge.domain.models import RequestStatus
 
     session_factory = get_session_factory(settings)
 
@@ -51,10 +51,29 @@ def _create_job_handler(settings: Settings) -> Any:
     # F2: Create retrieval service
     retrieval_service = _create_retrieval_service(settings)
 
-    # F9: Create checkpointer
-    from aegisforge.workflows.checkpoint import WorkflowCheckpointer, get_checkpoint_store
+    # F9: Durable (DB-backed) checkpoint store shared with the API process
+    from aegisforge.workflows.checkpoint import WorkflowCheckpointer, get_db_checkpoint_store
 
-    checkpoint_store = get_checkpoint_store()
+    checkpoint_store = get_db_checkpoint_store(settings)
+    approval_service = ApprovalService(session_factory=session_factory, approval_timeout_hours=settings.approval_timeout_hours)
+
+    def _update_job_model(db: Any, job: Any, status: str, result: dict[str, Any] | None = None, error: str | None = None) -> None:
+        """Persist job lifecycle state to the database (source of truth)."""
+        from aegisforge.db.models import ExecutionJobModel
+
+        job_model = db.query(ExecutionJobModel).filter(ExecutionJobModel.id == job.job_id).first()
+        if job_model is None:
+            return
+        job_model.status = status
+        if result is not None:
+            import json as _json
+
+            job_model.result_json = _json.dumps(result)
+        if error is not None:
+            import json as _json
+
+            job_model.error_json = _json.dumps([error])
+        db.commit()
 
     def handler(job: Any) -> dict[str, Any]:
         """Execute a workflow for a job."""
@@ -62,14 +81,19 @@ def _create_job_handler(settings: Settings) -> Any:
         try:
             from aegisforge.db.models import RequestModel
 
+            organization_id = job.organization_id or ""
             request = db.query(RequestModel).filter(RequestModel.id == job.request_id).first()
             if request is None:
                 raise ValueError(f"Request {job.request_id} not found")
+            organization_id = organization_id or request.organization_id
+
+            # Persist job status: queued -> running
+            _update_job_model(db, job, ExecutionJobStatus.RUNNING.value)
 
             # Record workflow start
             record_audit_event(
                 db,
-                organization_id=job.organization_id or request.organization_id,
+                organization_id=organization_id,
                 actor_id=request.requested_by,
                 action="workflow.started",
                 resource_type="request",
@@ -85,7 +109,7 @@ def _create_job_handler(settings: Settings) -> Any:
             checkpointer = WorkflowCheckpointer(
                 workflow_id=job.workflow_id,
                 request_id=job.request_id,
-                organization_id=job.organization_id or request.organization_id,
+                organization_id=organization_id,
                 store=checkpoint_store,
             )
 
@@ -96,26 +120,62 @@ def _create_job_handler(settings: Settings) -> Any:
                 request_id=job.request_id,
                 intent=request.intent,
                 user_id=request.requested_by,
-                organization_id=job.organization_id or request.organization_id,
+                organization_id=organization_id,
                 workflow_id=job.workflow_id,
                 checkpointer=checkpointer,
                 model_provider=model_provider,
                 retrieval_service=retrieval_service,
+                approval_service=approval_service,
+                job_id=job.job_id,
+                trace_id=job.trace_id,
             )
+
+            final_status = final_state.get("status", "failed")
 
             # Persist results
             from aegisforge.services.execution_service import (
                 _persist_agent_executions,
-                _persist_tool_executions,
                 _persist_tasks,
+                _persist_tool_executions,
             )
 
             _persist_agent_executions(db, job.request_id, final_state)
             _persist_tool_executions(db, job.request_id, final_state)
             _persist_tasks(db, job.request_id, final_state)
 
+            # If the workflow paused for approval, record that in the job
+            if final_status == RequestStatus.ACTION_REQUIRES_APPROVAL.value:
+                _update_job_model(
+                    db,
+                    job,
+                    ExecutionJobStatus.WAITING_FOR_APPROVAL.value,
+                    result={"workflow_id": job.workflow_id, "status": final_status},
+                )
+                record_audit_event(
+                    db,
+                    organization_id=organization_id,
+                    actor_id=request.requested_by,
+                    action="workflow.paused_for_approval",
+                    resource_type="request",
+                    resource_id=job.request_id,
+                    outcome="success",
+                    metadata={
+                        "final_status": final_status,
+                        "workflow_id": job.workflow_id,
+                        "approval_id": final_state.get("approval_id", ""),
+                    },
+                    request_id=job.request_id,
+                )
+                return {
+                    "request_id": job.request_id,
+                    "workflow_id": job.workflow_id,
+                    "status": final_status,
+                    "approval_id": final_state.get("approval_id", ""),
+                    "final_result": {},
+                    "errors": [],
+                }
+
             # Update final status
-            final_status = final_state.get("status", "failed")
             try:
                 status_enum = RequestStatus(final_status)
             except ValueError:
@@ -123,10 +183,17 @@ def _create_job_handler(settings: Settings) -> Any:
 
             update_request_status(db, job.request_id, status_enum)
 
+            job_status = (
+                ExecutionJobStatus.COMPLETED.value
+                if status_enum == RequestStatus.COMPLETED
+                else ExecutionJobStatus.FAILED.value
+            )
+            _update_job_model(db, job, job_status, result=final_state)
+
             # Record completion
             record_audit_event(
                 db,
-                organization_id=job.organization_id or request.organization_id,
+                organization_id=organization_id,
                 actor_id=request.requested_by,
                 action="workflow.completed",
                 resource_type="request",
@@ -150,7 +217,13 @@ def _create_job_handler(settings: Settings) -> Any:
 
 
 def _create_retrieval_service(settings: Settings) -> Any:
-    """Create a RetrievalService if embedding provider is configured."""
+    """Create a RetrievalService if embedding provider is configured.
+
+    In production, PostgreSQL/pgvector is REQUIRED when a PostgreSQL
+    database is configured — failure is raised, not silently swallowed,
+    so the worker fails clearly instead of degrading to in-memory.
+    """
+    is_production = settings.environment not in ("development", "test", "")
     try:
         from aegisforge.rag.embeddings import get_embedding_provider
         from aegisforge.rag.retrieval import RetrievalService
@@ -175,6 +248,14 @@ def _create_retrieval_service(settings: Settings) -> Any:
             vector_store=vector_store,
         )
     except Exception as exc:
+        if is_production and settings.database_url.startswith("postgresql"):
+            logger.critical(
+                "PostgreSQL/pgvector retrieval service required in production "
+                "but failed to initialize: %s. Failing clearly instead of "
+                "silently falling back to in-memory vector store.",
+                exc,
+            )
+            raise
         logger.warning("Could not create retrieval service: %s", exc)
         return None
 
@@ -197,6 +278,9 @@ def run_worker(settings: Settings | None = None) -> None:
 
     # F7: Create queue — fail clearly if Redis is unavailable in production
     is_production = settings.environment not in ("development", "test", "")
+    from aegisforge.async_execution.jobs import JobQueue as _JobQueue
+
+    queue: _JobQueue
     try:
         import redis
 
@@ -238,8 +322,8 @@ def run_worker(settings: Settings | None = None) -> None:
             else:
                 time.sleep(poll_interval)
                 poll_interval = min(poll_interval * 1.5, 10.0)
-        except Exception as exc:
-            logger.exception("Worker error: %s", exc)
+        except Exception:
+            logger.exception("Worker error")
             time.sleep(5.0)
 
     logger.info("Worker shutdown complete")

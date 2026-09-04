@@ -7,12 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files
-COPY pyproject.toml .
+# Copy package metadata and source (editable install requires both)
+COPY pyproject.toml README.md ./
+COPY src/ src/
 RUN pip install --no-cache-dir -e .
 
-# Copy application code
-COPY src/ src/
+# Copy remaining application files
 COPY alembic/ alembic/
 COPY alembic.ini .
 

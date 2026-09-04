@@ -5,16 +5,17 @@ Provides real measured metrics, not fabricated values.
 from __future__ import annotations
 
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Any
 
 try:
     from prometheus_client import (
-        Counter,
-        Histogram,
-        Gauge,
-        generate_latest,
         CONTENT_TYPE_LATEST,
+        Counter,
+        Gauge,
+        Histogram,
+        generate_latest,
     )
 
     # Request metrics
@@ -78,6 +79,19 @@ try:
         buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
     )
 
+    # Agent metrics
+    AGENT_EXECUTIONS_TOTAL = Counter(
+        "agent_executions_total",
+        "Total agent executions",
+        ["agent_type", "status"],
+    )
+    AGENT_DURATION = Histogram(
+        "agent_duration_seconds",
+        "Agent execution duration",
+        ["agent_type"],
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+    )
+
     # RAG metrics
     RAG_RETRIEVAL_TOTAL = Counter(
         "rag_retrieval_total",
@@ -93,6 +107,10 @@ try:
         "rag_chunks_retrieved",
         "Number of chunks retrieved per query",
         buckets=[1, 2, 3, 5, 10, 20],
+    )
+    RAG_INSUFFICIENT_CONTEXT_TOTAL = Counter(
+        "rag_insufficient_context_total",
+        "Total RAG retrievals with insufficient context",
     )
 
     # Approval metrics
@@ -111,6 +129,11 @@ try:
     QUEUE_DEPTH = Gauge(
         "queue_depth",
         "Current job queue depth",
+    )
+    QUEUE_JOBS_TOTAL = Counter(
+        "queue_jobs_total",
+        "Total jobs by lifecycle status",
+        ["status"],
     )
     JOB_DURATION = Histogram(
         "job_duration_seconds",
@@ -212,7 +235,7 @@ def track_tool_execution(tool_name: str) -> Generator[None, None, None]:
 @contextmanager
 def track_rag_retrieval() -> Generator[dict[str, Any], None, None]:
     """Track a RAG retrieval."""
-    metadata: dict[str, Any] = {"chunk_count": 0}
+    metadata: dict[str, Any] = {"chunk_count": 0, "insufficient_context": False}
     if not HAS_PROMETHEUS:
         yield metadata
         return
@@ -229,3 +252,61 @@ def track_rag_retrieval() -> Generator[dict[str, Any], None, None]:
         chunks = metadata.get("chunk_count", 0)
         if chunks > 0:
             RAG_CHUNKS_RETRIEVED.observe(chunks)
+        if metadata.get("insufficient_context"):
+            RAG_INSUFFICIENT_CONTEXT_TOTAL.inc()
+
+
+def record_agent_execution(
+    agent_type: str,
+    status: str,
+    duration_ms: int,
+) -> None:
+    """Record an agent execution with duration."""
+    if not HAS_PROMETHEUS:
+        return
+    AGENT_EXECUTIONS_TOTAL.labels(agent_type=agent_type, status=status).inc()
+    if duration_ms > 0:
+        AGENT_DURATION.labels(agent_type=agent_type).observe(duration_ms / 1000.0)
+
+
+def record_approval_event(risk_level: str, status: str, wait_seconds: float | None = None) -> None:
+    """Record an approval lifecycle event.
+
+    status: one of requested, approved, rejected, expired, cancelled
+    """
+    if not HAS_PROMETHEUS:
+        return
+    APPROVAL_REQUESTS_TOTAL.labels(risk_level=risk_level, status=status).inc()
+    if wait_seconds is not None and status in ("approved", "rejected", "expired", "cancelled"):
+        APPROVAL_WAIT_DURATION.observe(max(wait_seconds, 0.0))
+
+
+def record_queue_event(status: str) -> None:
+    """Record a job queue lifecycle event.
+
+    status: one of queued, running, retried, completed, failed, cancelled
+    """
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_TOTAL.labels(status=status).inc()
+
+
+def record_job_duration(status: str, duration_seconds: float) -> None:
+    """Record job processing duration by outcome."""
+    if not HAS_PROMETHEUS:
+        return
+    JOB_DURATION.labels(status=status).observe(max(duration_seconds, 0.0))
+
+
+def record_workflow_retry() -> None:
+    """Record a workflow retry event."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKFLOW_RETRIES_TOTAL.inc()
+
+
+def set_queue_depth(depth: int) -> None:
+    """Update the current queue depth gauge."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_DEPTH.set(depth)

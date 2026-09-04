@@ -10,6 +10,25 @@ from pydantic import BaseModel
 
 from aegisforge.domain.models import ToolExecutionStatus
 from aegisforge.domain.models import ToolExecutionStatus as TStatus
+from aegisforge.observability.metrics import track_tool_execution
+
+
+class _NoOpCtx:
+    """Fallback context manager when prometheus is unavailable."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def _track_tool(tool_name: str) -> Any:
+    """Return a tracking context manager, degrading gracefully."""
+    try:
+        return track_tool_execution(tool_name)
+    except Exception:
+        return _NoOpCtx()
 
 # --- Tool Definition ---
 
@@ -96,10 +115,11 @@ class BaseTool(ABC):
                 execution_id=exec_id,
             )
 
-        # Execute with timing
+        # Execute with timing + Prometheus instrumentation
         start = time.monotonic()
         try:
-            output = self._execute(input_data)
+            with _track_tool(self.name):
+                output = self._execute(input_data)
             elapsed = int((time.monotonic() - start) * 1000)
             return ToolExecutionResult(
                 status=TStatus.COMPLETED,

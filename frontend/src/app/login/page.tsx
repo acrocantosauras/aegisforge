@@ -64,8 +64,9 @@ export default function LoginPage() {
         <form onSubmit={handleSubmit}>
           {isRegister && (
             <div className="form-group">
-              <label>Full Name</label>
+              <label htmlFor="fullName">Full Name</label>
               <input
+                id="fullName"
                 type="text"
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
@@ -75,8 +76,9 @@ export default function LoginPage() {
           )}
 
           <div className="form-group">
-            <label>Email</label>
+            <label htmlFor="email">Email</label>
             <input
+              id="email"
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -85,8 +87,9 @@ export default function LoginPage() {
           </div>
 
           <div className="form-group">
-            <label>Password</label>
+            <label htmlFor="password">Password</label>
             <input
+              id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
