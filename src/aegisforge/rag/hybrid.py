@@ -459,6 +459,11 @@ class HybridRetrievalService:
         self._assembler = context_assembler or ContextAssembler()
         self._fusion_candidates = max(fusion_candidates, 10)
         self._lexical_top_k = lexical_top_k
+        self._last_query: str = ""
+        self._last_org: str = ""
+        self._last_top_k: int = 5
+        self._last_threshold: float = 0.0
+        self._last_use_expansion: bool = False
 
     def retrieve(
         self,
@@ -514,6 +519,13 @@ class HybridRetrievalService:
             logger.warning("Lexical search failed (non-fatal): %s", exc)
             lexical_results = []
 
+        if not semantic_results and not lexical_results:
+            logger.debug(
+                "Hybrid retrieval returned no candidates for query %r in org %r",
+                query.query,
+                query.organization_id,
+            )
+
         # Fusion.
         fused = reciprocal_rank_fusion(
             semantic_results,
@@ -527,6 +539,14 @@ class HybridRetrievalService:
             fused,
             top_k=query.top_k,
         )
+
+        # Remember the last retrieval parameters so the adapter can rebuild
+        # the final optimized context without re-deriving query intent.
+        self._last_query = query.query
+        self._last_org = query.organization_id
+        self._last_top_k = query.top_k
+        self._last_threshold = query.similarity_threshold
+        self._last_use_expansion = use_query_expansion
 
         # Context management.
         context = self._assembler.assemble(reranked)
@@ -542,7 +562,11 @@ class HybridRetrievalService:
             latency_ms=int((time.monotonic() - start) * 1000),
         )
         try:
-            record_rag_hybrid_retrieval(response)
+            record_rag_hybrid_retrieval(
+                response,
+                semantic_candidates=len(semantic_results),
+                lexical_candidates=len(lexical_results),
+            )
         except Exception:  # noqa: S110 - observability must never break retrieval
             pass
         return response
@@ -554,6 +578,10 @@ class RAGHybridAdapter(RetrievalService):
 
     When hybrid mode is enabled, RAG tasks transparently benefit from
     fusion + reranking + managed context without changing agent code.
+
+    The adapter exposes the hybrid assembler's final context so the final
+    evidence set returned to the agent reflects reranking and context
+    optimization rather than raw retrieval results.
     """
 
     is_hybrid: bool = True
@@ -572,9 +600,32 @@ class RAGHybridAdapter(RetrievalService):
 
     def build_context(
         self,
-        results: list[RetrievalResult],
+        results: list[RetrievalResult] | None = None,
         max_context_length: int = 4000,
     ) -> str:
+        """Build final grounded context from hybrid-optimized results.
+
+        If results are provided, they are used directly. If not, the adapter
+        re-runs the hybrid retrieval for the most recent query so the final
+        context reflects the optimizer's selected and deduped evidence.
+        """
+        if results is None:
+            from aegisforge.domain.models import RetrievalQuery
+
+            query_text = self._hybrid._last_query or ""
+            if not query_text:
+                return ""
+            response = self._hybrid.retrieve(
+                RetrievalQuery(
+                    query=query_text,
+                    organization_id=self._hybrid._last_org or "",
+                    top_k=self._hybrid._last_top_k,
+                    similarity_threshold=self._hybrid._last_threshold,
+                ),
+                use_query_expansion=self._hybrid._last_use_expansion,
+            )
+            results = response.results
+
         assembled = self._assembler.assemble(results)
         return assembled.context_text
 

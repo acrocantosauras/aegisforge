@@ -104,11 +104,12 @@ def _token_overlap_score(query_tokens: list[str], content: str) -> float:
     content_tokens = _tokenize(content)
     if not content_tokens:
         return 0.0
-    total = 0
-    for token in query_tokens:
-        total += content_tokens.count(token)
-    max_possible = len(content_tokens)
-    return min(1.0, total / max_possible) if max_possible else 0.0
+    relevant = len(set(query_tokens) & set(content_tokens))
+    if relevant == 0:
+        return 0.0
+    match_ratio = relevant / len(query_tokens)
+    tf = sum(content_tokens.count(token) for token in query_tokens)
+    return min(1.0, 0.4 + 0.6 * match_ratio + 0.2 * (tf / len(content_tokens)))
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:

@@ -74,6 +74,7 @@ class RetrievalService:
 
             rag_meta["chunk_count"] = len(results)
             rag_meta["insufficient_context"] = len(results) == 0
+            rag_meta["lexical_top_k"] = 0
 
         logger.info(
             "Retrieved %d chunks for query in org %s (top_k=%d, threshold=%.2f)",
@@ -93,6 +94,11 @@ class RetrievalService:
         """Build a grounded context string from retrieval results.
 
         Distinguishes retrieved evidence from any generated reasoning.
+
+        This is the default context builder used by RAGAgent when no hybrid
+        adapter is configured. Hybrid adapters may override this behavior by
+        returning a retrieval service that already performs context
+        optimization; in that case the agent consumes the optimized context.
         """
         if not results:
             return ""

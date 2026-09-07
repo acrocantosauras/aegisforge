@@ -1,0 +1,273 @@
+MISSION: AEGISFORGE PHASE 5.1A — ADVANCED KNOWLEDGE/RAG READINESS AUDIT
+
+You are operating on the AegisForge repository.
+
+Current baseline:
+- Phase 5 Multi-Agent Orchestration MVP is complete.
+- CI hardening commit: 59c2455
+- GitHub Actions is currently passing.
+- The working system has real PostgreSQL/pgvector, Redis, API, worker, LangGraph, multi-agent orchestration, observability, checkpointing, approvals, and evaluation.
+
+Phase 5.1 is Advanced Knowledge/RAG.
+
+However, before implementing anything, perform a READ-ONLY engineering audit of the existing repository.
+
+PRIMARY OBJECTIVE
+Determine exactly what AegisForge already has for Advanced RAG, what is actually wired into the production execution path, what is only an abstraction/dead code, what is adequately tested, and what is genuinely missing.
+
+DO NOT modify source code, tests, configuration, documentation, migrations, dependencies, or CI.
+DO NOT commit or push anything.
+This is an investigation and architecture audit only.
+
+FIRST: UNDERSTAND THE CURRENT SYSTEM
+Inspect the repository structure and understand:
+- Current RAG architecture
+- Document ingestion pipeline
+- Embedding pipeline
+- PostgreSQL/pgvector integration
+- RetrievalService abstraction
+- RAGAgent
+- Existing rag/hybrid.py
+- Existing vector retrieval
+- Existing lexical retrieval
+- Existing RRF implementation
+- Existing reranking
+- Existing query expansion
+- Existing context assembly/optimization
+- Existing RAG evaluation
+- Existing RAG-related metrics/tracing
+- How RAG is invoked by the LangGraph workflow
+- How RAG behaves through API → worker → LangGraph
+- Existing RAG tests
+- Existing real PostgreSQL/pgvector integration tests
+- Existing deterministic/test providers versus production providers
+
+Trace the actual runtime path, not merely class definitions.
+
+CRITICAL DISTINCTION
+For every major RAG capability, classify it as exactly one of:
+A. Implemented + production-wired
+B. Implemented + tested but not production-wired
+C. Partially implemented
+D. Test-only/mock implementation
+E. Missing
+
+Do not assume that a class existing means the feature is implemented. Follow the call chain and identify where the feature is actually invoked.
+
+AUDIT THESE CAPABILITIES
+
+1. Hybrid Retrieval
+Determine:
+- Is vector retrieval implemented?
+- Is lexical retrieval implemented?
+- Are they actually combined?
+- Is RRF actually used?
+- Where does this happen?
+- Is this path used by RAGAgent?
+- Is it used in the real API/worker execution path?
+- Is PostgreSQL/pgvector involved in the production path?
+- Are there silent in-memory fallbacks?
+
+2. Reranking
+Determine:
+- Does a reranker exist?
+- What interface does it use?
+- Is it deterministic, model-based, or both?
+- Is it actually called?
+- At what point in retrieval?
+- What candidate count enters reranking?
+- What result count leaves it?
+- Is reranking tested?
+- Is production behavior tested?
+
+3. Query Expansion
+Determine:
+- Does query expansion exist?
+- How are expanded queries generated?
+- Is expansion deterministic or LLM-based?
+- Is it actually used?
+- Are multiple queries retrieved?
+- Are results merged/deduplicated?
+- Is this behavior covered by tests?
+
+4. Context Optimization
+Determine:
+- How chunks are selected after retrieval.
+- Whether duplicate/redundant chunks are removed.
+- Whether context has a token/size budget.
+- Whether source metadata survives optimization.
+- Whether citation information survives.
+- Whether context ordering is deterministic.
+- Whether the context builder is actually used by RAGAgent.
+
+5. RAG Evaluation
+Determine:
+- What RAG evaluation currently exists.
+- Whether retrieval quality is measured.
+- Whether context relevance/coverage is measured.
+- Whether answer groundedness is measured.
+- Whether citation correctness is measured.
+- Whether evaluation is deterministic.
+- Whether evaluation runs automatically.
+- Whether evaluation results are persisted.
+- Whether evaluation metrics are exposed through the API/observability layer.
+
+REAL-INFRASTRUCTURE VERIFICATION
+Inspect the existing integration tests and determine exactly what has been proven against:
+- Real PostgreSQL
+- Real pgvector
+- Real Redis
+- Real API
+- Separate worker
+- Real LangGraph execution
+
+Specifically identify which RAG behaviors have real infrastructure evidence versus mocked/unit-test evidence. Do not claim something is production-proven simply because a unit test passes.
+
+TENANCY AND SECURITY AUDIT
+Verify the RAG path for:
+- tenant/org isolation
+- document ownership
+- retrieval filtering
+- chunk isolation
+- metadata leakage
+- citation leakage
+- prompt injection handling
+- malicious document handling
+- secret detection
+- authorization
+
+Identify any path where a query could retrieve another tenant's data.
+
+PERFORMANCE / ENGINEERING AUDIT
+Inspect for:
+- unnecessary database calls
+- N+1 retrieval patterns
+- excessive candidate retrieval
+- inefficient deduplication
+- unbounded context construction
+- unnecessary LLM calls
+- missing timeouts
+- missing retries
+- synchronous blocking operations
+- uncontrolled concurrency
+- expensive operations that should be configurable
+
+Do not optimize prematurely. Only identify measurable or structurally obvious concerns.
+
+OBSERVABILITY AUDIT
+Determine whether the real RAG execution emits useful telemetry for:
+- retrieval latency
+- candidate counts
+- final context size
+- reranking latency
+- embedding latency
+- LLM latency
+- token usage where available
+- retrieval failures
+- insufficient-context events
+- evaluation results
+
+Also verify that sensitive document contents, prompts, secrets, and retrieved private text are not accidentally exposed in logs or public introspection APIs.
+
+TEST QUALITY AUDIT
+Inspect existing tests and classify them:
+- unit
+- integration
+- real-infrastructure
+- end-to-end
+- evaluation dataset tests
+
+Identify important missing tests. Pay particular attention to tests that could falsely pass while the actual production RAG path is disconnected.
+
+DO NOT REBUILD EXISTING WORK
+This is extremely important. AegisForge already contains substantial RAG infrastructure from Phase 3, Phase 4, and Phase 5. Do NOT recommend rewriting existing abstractions simply because a different architecture might be cleaner. Prefer:
+reuse → wire → harden → test → improve
+over:
+rewrite → replace → expand
+
+Only recommend architectural changes when there is a concrete engineering reason.
+
+DEFINE THE ACTUAL 5.1A GAP
+After auditing the repository, produce a concise gap analysis:
+EXISTING AND GOOD
+-----------------
+...
+
+EXISTING BUT NOT WIRED
+---------------------
+...
+
+PARTIALLY IMPLEMENTED
+---------------------
+...
+
+MISSING
+-------
+...
+
+PRODUCTION RISKS
+----------------
+...
+
+TESTING GAPS
+------------
+...
+
+Then determine the smallest technically complete implementation scope for Phase 5.1A — Retrieval Quality.
+
+PHASE 5.1A TARGET
+Phase 5.1A should focus primarily on:
+Hybrid Retrieval + Retrieval Quality
+
+Its eventual acceptance criterion should be:
+Given a realistic enterprise document set, AegisForge can retrieve relevant evidence for exact, semantic, and paraphrased queries using the real production retrieval path, while preserving tenant isolation, citations, deterministic behavior in tests, and measurable retrieval quality.
+
+Do NOT expand 5.1A into:
+- knowledge graphs
+- GraphRAG
+- multimodal RAG
+- web search
+- agentic research
+- adaptive planning
+- distributed databases
+- advanced agent intelligence
+- MCP ecosystem expansion
+
+Those are separate future phases.
+
+REQUIRED FINAL REPORT
+Return a technical audit report containing:
+- Executive verdict
+- Current RAG architecture
+- Actual runtime execution path
+- Capability-by-capability classification
+- Production-wired vs dead/unwired components
+- Real infrastructure evidence
+- Security/tenant-isolation findings
+- Observability findings
+- Testing gaps
+- Performance concerns
+- Exact Phase 5.1A scope
+- Explicitly out-of-scope items
+- Definition of Done for 5.1A
+- Recommended implementation order
+- Risk level: BLOCKER / HIGH / MEDIUM / LOW
+
+For every important finding, provide the relevant file path and symbol/function/class where possible.
+
+FINAL RULES
+READ ONLY.
+No edits.
+No generated code.
+No dependency changes.
+No migrations.
+No commits.
+No pushes.
+Do not start Phase 5.1B.
+Do not start Phase 5.2.
+Do not "improve" unrelated code.
+
+The purpose of this mission is to give the next implementation mission a precise, evidence-based scope.
+
+Finish with one sentence answering:
+"What exactly should we build next, and why?"

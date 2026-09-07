@@ -32,6 +32,11 @@ class RAGAgent(BaseAgent):
     - Provides source references (citations)
     - Distinguishes retrieved evidence from generated reasoning
     - Handles insufficient context gracefully
+
+    When a hybrid retrieval adapter is used, the final evidence set may be
+    produced by a retrieval service that already performed fusion, reranking,
+    and context optimization. This agent does not duplicate that work; it
+    consumes the retrieval service's results and the context it returns.
     """
 
     def __init__(
@@ -85,6 +90,14 @@ class RAGAgent(BaseAgent):
         # Retrieve authorized content
         retrieval_results = self._retrieval_service.retrieve(retrieval_query)
 
+        # Build final grounded context from the retrieval service.
+        # Hybrid retrieval adapters may already perform reranking and context
+        # optimization; the agent consumes the result without duplicating it.
+        context_text = self._retrieval_service.build_context(
+            retrieval_results,
+            max_context_length=input_data.get("max_context_length", 4000),
+        )
+
         # Build citations
         citations: list[dict[str, Any]] = []
         evidence_texts: list[str] = []
@@ -99,9 +112,6 @@ class RAGAgent(BaseAgent):
             }
             citations.append(citation)
             evidence_texts.append(result.content)
-
-        # Build grounded context
-        context_text = self._retrieval_service.build_context(retrieval_results)
 
         # Handle insufficient context
         if not retrieval_results:

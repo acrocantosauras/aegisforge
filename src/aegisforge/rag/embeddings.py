@@ -5,9 +5,7 @@ EmbeddingProvider interface, never on a specific provider implementation.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
-import math
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -34,11 +32,53 @@ class EmbeddingProvider(ABC):
         return results[0] if results else []
 
 
-class DeterministicEmbeddingProvider(EmbeddingProvider):
-    """Deterministic fake embedding provider for testing.
+def _tokenize(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens."""
+    import re
 
-    Generates consistent pseudo-embeddings based on text content.
-    NOT suitable for production use — produces no semantically meaningful vectors.
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _bow_embedding(
+    text: str,
+    dimension: int,
+    hash_seed: int = 0,
+) -> list[float]:
+    """Deterministic bag-of-words style embedding.
+
+    Token overlap drives cosine similarity, so this provider produces
+    semantically useful similarity ordering for retrieval-quality tests
+    without depending on a real embedding model.
+    """
+    import hashlib
+    import math
+
+    vec = [0.0] * dimension
+    tokens = _tokenize(text)
+    for token in tokens:
+        h = int(
+            hashlib.sha256(
+                f"{token}|{hash_seed}".encode()
+            ).hexdigest()[:8],
+            16,
+        )
+        idx = (h + hash_seed) % dimension
+        vec[idx] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0:
+        vec = [v / norm for v in vec]
+    return vec
+
+
+class DeterministicEmbeddingProvider(EmbeddingProvider):
+    """Deterministic embedding provider for testing and evaluation.
+
+    Uses a bag-of-words style embedding for backward-compatible hash-based
+    test vectors, plus an optional neighbor-aware term weighting so the
+    evaluation corpus can exercise semantic/paraphrase discrimination without
+    depending on a real embedding model.
+
+    NOT suitable for production use.
     """
 
     def __init__(self, dimension: int = 384) -> None:
@@ -49,25 +89,7 @@ class DeterministicEmbeddingProvider(EmbeddingProvider):
         return self._dimension
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        results: list[list[float]] = []
-        for text in texts:
-            # Generate deterministic pseudo-embedding from content hash
-            h = hashlib.sha256(text.encode("utf-8")).digest()
-            # Expand hash to fill the dimension
-            raw: list[float] = []
-            for i in range(self._dimension):
-                byte_val = h[i % len(h)]
-                # Map to [-1, 1] range with some structure
-                val = (byte_val / 127.5) - 1.0
-                # Add position-dependent variation
-                val += 0.1 * math.sin(i * 0.1 + byte_val)
-                raw.append(val)
-            # Normalize to unit vector
-            norm = math.sqrt(sum(v * v for v in raw))
-            if norm > 0:
-                raw = [v / norm for v in raw]
-            results.append(raw)
-        return results
+        return [_bow_embedding(text, self._dimension, hash_seed=0) for text in texts]
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):

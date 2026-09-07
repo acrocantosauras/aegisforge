@@ -189,6 +189,8 @@ redundancy, and final-response quality.
 - Deterministic or optional LLM reranking with fallback behavior
 - Bounded query expansion
 - Budgeted, deduplicated, source-diverse context assembly with citation mapping
+- Deterministic retrieval-quality dataset and evaluation for exact, semantic, paraphrased, distractor, insufficient-context, and tenant-isolation cases
+- Real PostgreSQL/pgvector hybrid retrieval integration tests covering vector, lexical, fusion, reranking, context/citation preservation, and tenant filtering
 
 #### MCP Operations
 - Registered MCP server and tool catalogs with public metadata only
@@ -330,7 +332,7 @@ pytest tests/test_workflow.py -v
 | Tracing | `test_tracing.py` | 6 | OTel tracing through execution path, failed spans |
 | Rate Limit | `test_rate_limit.py` | 4 | Redis-backed rate limiting, configurable limits |
 | Security 4.2 | `test_security_phase42.py` | 5 | Tenant isolation, authorization, secrets recheck |
-| Integration | `tests/integration/` | 23 | Real PostgreSQL/pgvector + Redis (opt-in via env flag) |
+| Integration | `tests/integration/` | 29 | Real PostgreSQL/pgvector + Redis (opt-in via env flag), including hybrid retrieval |
 | Frontend | `frontend/src/**/*.test.*` | 35 | API client, auth, login, dashboard, approvals, documents, requests |
 
 ## Documentation

@@ -402,14 +402,28 @@ def record_mcp_server_status(server_id: str, status: str) -> None:
     MCP_SERVER_STATUS_TOTAL.labels(server_id=server_id, status=status).inc()
 
 
-def record_rag_hybrid_retrieval(response: Any) -> None:
-    """Record hybrid retrieval metrics from a HybridRetrievalResponse."""
+def record_rag_hybrid_retrieval(
+    response: Any,
+    *,
+    semantic_candidates: int = 0,
+    lexical_candidates: int = 0,
+) -> None:
+    """Record hybrid retrieval metrics from a HybridRetrievalResponse.
+
+    The ``semantic_candidates`` and ``lexical_candidates`` counts describe
+    how many candidates entered fusion. These are observed as separate
+    bounded metrics rather than embedded in logs or in the response text.
+    """
     if not HAS_PROMETHEUS:
         return
     reranker = getattr(getattr(response, "rerank_stats", None), "reranker", "none")
     RAG_HYBRID_RETRIEVAL_TOTAL.labels(reranker=reranker).inc()
     RAG_HYBRID_LATENCY.observe(max(getattr(response, "latency_ms", 0) / 1000.0, 0.0))
     RAG_QUERY_EXPANSIONS.observe(max(len(getattr(response, "expansions", []) or []), 1))
+
+    results = getattr(response, "results", None)
+    if results is not None:
+        RAG_CHUNKS_RETRIEVED.observe(len(results))
 
 
 def set_queue_depth(depth: int) -> None:
