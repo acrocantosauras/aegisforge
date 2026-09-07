@@ -284,6 +284,7 @@ pytest --cov=aegisforge --cov-report=term-missing
 
 # Real PostgreSQL + pgvector + Redis integration tests (requires services)
 docker compose up -d postgres redis
+docker compose run --rm api alembic upgrade head
 AEGISFORGE_INTEGRATION_TESTS=true pytest -q tests/integration
 
 # Frontend tests

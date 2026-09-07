@@ -10,7 +10,6 @@ import os
 
 import pytest
 
-from aegisforge.db.base import Base
 from aegisforge.db.session import get_engine
 
 REQUIRE_REAL = os.environ.get("AEGISFORGE_INTEGRATION_TESTS", "").lower() == "true"
@@ -32,9 +31,8 @@ REDIS_URL = os.environ.get(
 
 @pytest.fixture(scope="session")
 def pg_engine():
-    """Real PostgreSQL engine with all tables created."""
+    """Real PostgreSQL engine with schema supplied by migrations."""
     engine = get_engine(PG_URL)
-    Base.metadata.create_all(bind=engine)
     yield engine
     engine.dispose()
 
