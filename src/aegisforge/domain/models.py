@@ -62,6 +62,8 @@ class AgentType(str, Enum):
     CODE = "code"
     VISION = "vision"
     EVALUATOR = "evaluator"
+    ANALYSIS = "analysis"
+    SYNTHESIS = "synthesis"
 
 
 class ExecutionJobStatus(str, Enum):
@@ -204,6 +206,15 @@ class AuditEvent(EntityModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskFailurePolicy(str, Enum):
+    """How a task behaves when one of its dependencies fails."""
+
+    FAIL_FAST = "fail_fast"
+    CONTINUE_WITH_PARTIAL_RESULTS = "continue_with_partial_results"
+    RETRY_FAILED_TASK = "retry_failed_task"
+    REQUIRE_ALL_DEPENDENCIES = "require_all_dependencies"
+
+
 class ExecutionPlanTask(BaseModel):
     task_id: str
     description: str
@@ -213,6 +224,66 @@ class ExecutionPlanTask(BaseModel):
     expected_output_description: str = ""
     tool_permissions_required: list[str] = Field(default_factory=list)
     risk_level: str = "low"  # low, medium, high, critical — gates human approval
+    # Phase 5: execution controls
+    timeout_seconds: float = Field(default=120.0, gt=0)  # fractional seconds allowed
+    max_retries: int = 2
+    retry_delay_seconds: float = 0.0
+    # Default tolerance: dependent tasks may run on partial results and must
+    # flag missing evidence.  Explicitly set FAIL_FAST / REQUIRE_ALL when a
+    # strict boundary is required.
+    failure_policy: TaskFailurePolicy = TaskFailurePolicy.CONTINUE_WITH_PARTIAL_RESULTS
+    # Phase 5: inter-agent result passing. ``input_references`` maps a field
+    # name in this task's effective input to ``{task_id}.{output_path}`` from a
+    # declared dependency. ``output_key`` names this task's result so that
+    # downstream tasks can reference it (task_id is used when empty).
+    input_references: dict[str, str] = Field(default_factory=dict)
+    output_key: str = ""
+
+
+
+class TaskExecutionRecord(BaseModel):
+    """Runtime record of a single task inside a multi-agent run.
+
+    JSON-serializable, safe to checkpoint, and safe to expose to the
+    frontend.  Contains validated references only — never arbitrary state.
+    """
+
+    task_id: str
+    description: str = ""
+    agent_type: AgentType | str = ""
+    status: AgentExecutionStatus = AgentExecutionStatus.PENDING
+    dependencies: list[str] = Field(default_factory=list)
+    retry_count: int = 0
+    max_retries: int = 2
+    timeout_seconds: float = Field(default=120.0, gt=0)
+    failure_policy: TaskFailurePolicy = TaskFailurePolicy.CONTINUE_WITH_PARTIAL_RESULTS
+    started_at: float = 0.0  # monotonic seconds
+    completed_at: float = 0.0
+    duration_ms: int | None = None
+    summary: str = ""
+    output: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    approval_required: bool = False
+    approval_id: str = ""
+    worker_id: str = ""
+
+
+class ExecutionRunSummary(BaseModel):
+    """Aggregate summary of a multi-agent run."""
+
+    total_tasks: int = 0
+    completed_tasks: int = 0
+    failed_tasks: int = 0
+    timed_out_tasks: int = 0
+    skipped_tasks: int = 0
+    retried_tasks: int = 0
+    wave_count: int = 0
+    max_concurrency_reached: int = 0
+    total_duration_ms: int = 0
+    critical_path_ms: int = 0
+    average_concurrency: float = 0.0
 
 
 class ExecutionPlan(BaseModel):
@@ -322,6 +393,11 @@ class MCPServerConfig(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     timeout_seconds: int = 30
     enabled: bool = True
+    # Phase 5: operator-controlled metadata (never derived from LLM input).
+    version: str = "1.0"
+    risk_level: str = "medium"  # low | medium | high | critical
+    read_only_default: bool = True
+    description: str = ""
 
 
 class MCPToolDefinition(BaseModel):

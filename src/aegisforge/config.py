@@ -67,6 +67,28 @@ class Settings(BaseSettings):
     # Evaluation Settings
     llm_critic_enabled: bool = Field(default=True)
 
+    # Phase 5 — Multi-agent execution
+    workflow_execution_mode: str = Field(default="auto")  # auto | serial | parallel
+    max_parallel_tasks: int = Field(default=4)
+    task_default_timeout_seconds: int = Field(default=120)
+    task_default_max_retries: int = Field(default=2)
+
+    # Phase 5 — Advanced RAG (hybrid retrieval)
+    rag_hybrid_enabled: bool = Field(default=False)
+    rag_reranker: str = Field(default="deterministic")  # deterministic | llm
+    rag_query_expansion_enabled: bool = Field(default=False)
+    rag_query_expansion_max: int = Field(default=3)
+    rag_fusion_candidates: int = Field(default=60)
+    rag_context_max_tokens: int = Field(default=2000)
+    rag_lexical_top_k: int = Field(default=10)
+
+    # Phase 5 — MCP ecosystem
+    mcp_catalog_json: str = Field(
+        default="",
+        description="JSON array of MCPServerConfig-like dicts (no secrets). Secrets come from env.",
+    )
+    mcp_health_check_interval_seconds: int = Field(default=60)
+
     # Rate Limiting Settings
     rate_limit_enabled: bool = Field(default=False)
     rate_limit_max_requests: int = Field(default=300)

@@ -64,6 +64,10 @@ class MCPClient(ABC):
         """Check if connected to a server."""
         ...
 
+    def health_check(self, server_id: str) -> bool:
+        """Check liveness of a connected server (Phase 5)."""
+        return self.is_connected(server_id)
+
 
 class MockMCPClient(MCPClient):
     """Mock MCP client for testing.
@@ -75,15 +79,25 @@ class MockMCPClient(MCPClient):
         self._connected: dict[str, bool] = {}
         self._tools: dict[str, list[MCPToolDefinition]] = {}
         self._tool_responses: dict[str, MCPToolResult] = {}
+        self._health: dict[str, bool] = {}
 
     def connect(self, server_config: MCPServerConfig) -> bool:
         self._connected[server_config.server_id] = True
+        self._health[server_config.server_id] = True
         logger.info("Mock MCP: connected to %s", server_config.server_id)
         return True
 
     def disconnect(self, server_id: str) -> None:
         self._connected.pop(server_id, None)
+        self._health.pop(server_id, None)
         logger.info("Mock MCP: disconnected from %s", server_id)
+
+    def health_check(self, server_id: str) -> bool:
+        return self._connected.get(server_id, False) and self._health.get(server_id, True)
+
+    def set_health(self, server_id: str, healthy: bool) -> None:
+        """Test helper: simulate an unhealthy server."""
+        self._health[server_id] = healthy
 
     def discover_tools(self, server_id: str) -> list[MCPToolDefinition]:
         return self._tools.get(server_id, [])
@@ -244,6 +258,10 @@ class StdioMCPClient(MCPClient):
 
     def is_connected(self, server_id: str) -> bool:
         return self._connected.get(server_id, False)
+
+    def health_check(self, server_id: str) -> bool:
+        process = self._processes.get(server_id)
+        return self._connected.get(server_id, False) and process is not None and process.poll() is None
 
     def _send_request(
         self,

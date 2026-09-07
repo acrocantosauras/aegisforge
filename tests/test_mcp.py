@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import pytest
 
+from aegisforge.config import Settings
 from aegisforge.domain.models import MCPServerConfig, MCPToolDefinition
 from aegisforge.mcp.adapter import MCPToolAdapter, MCPToolManager
 from aegisforge.mcp.client import MCPToolResult, MockMCPClient
+from aegisforge.mcp.lifecycle import configure_mcp_registry
 from aegisforge.tools.registry import ToolRegistry
 
 
@@ -322,3 +324,30 @@ def test_mcp_tool_manager_register_in_registry() -> None:
         registry.register(adapter)
 
     assert registry.has_tool("mcp.test-server.search")
+
+
+def test_configured_mcp_registry_uses_lifecycle_and_allow_list(monkeypatch) -> None:
+    client = MockMCPClient()
+    client.register_tools(
+        "test-server",
+        [
+            MCPToolDefinition(name="search", server_id="test-server"),
+            MCPToolDefinition(name="blocked", server_id="test-server"),
+        ],
+    )
+    monkeypatch.setattr("aegisforge.mcp.lifecycle.StdioMCPClient", lambda: client)
+    settings = Settings(
+        environment="test",
+        mcp_enabled=True,
+        mcp_catalog_json=(
+            '[{"server_id":"test-server","name":"Test",'
+            '"allowed_tools":["search"],"command":"echo"}]'
+        ),
+    )
+
+    registry, lifecycle = configure_mcp_registry(settings)
+
+    assert lifecycle is not None
+    assert registry.has_tool("mcp.test-server.search")
+    assert not registry.has_tool("mcp.test-server.blocked")
+    lifecycle.shutdown()

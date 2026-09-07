@@ -106,8 +106,22 @@ def test_validate_plan_invalid_agent_type() -> None:
     # The validation should pass for valid agent types
     errors = validate_plan(plan)
     assert len(errors) == 0  # Valid plan
-    # The key test is that validate_plan checks against ALLOWED_AGENT_TYPES
-    # which includes all AgentType values
+
+
+def test_validate_plan_rejects_scheduler_unsupported_agent_type() -> None:
+    plan = ExecutionPlan(
+        plan_id="plan-1",
+        request_id="req-1",
+        tasks=[
+            ExecutionPlanTask(
+                task_id="t1",
+                description="Code task",
+                assigned_agent_type=AgentType.CODE,
+            )
+        ],
+    )
+    errors = validate_plan(plan)
+    assert any("unauthorized agent type" in error for error in errors)
 
 
 def test_validate_plan_missing_description() -> None:

@@ -168,6 +168,47 @@ Services: API, Worker, PostgreSQL, Redis, Frontend, OTel Collector, Prometheus, 
 - Frontend: npm lint, type-check
 - Integration test workflow (optional, requires services)
 
+### Phase 5 - Multi-Agent Orchestration and Operations
+
+#### Multi-Agent Workflow Execution
+- Dependency-aware task DAGs with validation for references, agent types, and cycles
+- Execution waves with bounded parallelism for independent tasks
+- Per-task retries, timeouts, failure policies, and approval gates
+- Pause/resume support with checkpoint-friendly task records and durable workflow state
+- Planner, Research, RAG, Analysis, Synthesis, and Evaluation agents
+- Structured task outputs and evidence references passed to dependent agents
+
+The planner uses the configured LLM provider when available and falls back to the
+deterministic planner. Research and RAG tasks can feed evidence to Analysis;
+Synthesis combines upstream results and citations, and workflow-level Evaluation
+reports planning, collaboration, evidence transfer, conflicts, missing evidence,
+redundancy, and final-response quality.
+
+#### Advanced RAG
+- Hybrid vector and lexical retrieval with reciprocal-rank fusion
+- Deterministic or optional LLM reranking with fallback behavior
+- Bounded query expansion
+- Budgeted, deduplicated, source-diverse context assembly with citation mapping
+
+#### MCP Operations
+- Registered MCP server and tool catalogs with public metadata only
+- Connection lifecycle management and health monitoring
+- Configured tool allow-lists and existing permission/risk/approval controls
+
+#### Phase 5 APIs
+- `GET /api/v1/workflows/{id}` - tenant-scoped workflow graph and task state
+- `GET /api/v1/workflows/{id}/tasks` - tenant-scoped task execution state
+- `GET /api/v1/workflows/{id}/evaluations` - workflow evaluation details
+- `GET /api/v1/tools` - registered tools and MCP metadata without secrets
+- `GET /api/v1/mcp/servers` - configured MCP server metadata
+- `GET /api/v1/mcp/tools` - discovered MCP tool metadata
+
+#### Phase 5 Validation Status
+- **Implemented and unit-tested:** DAG scheduling, execution waves, bounded concurrency, retries, timeouts, failure policies, approval gates, evidence passing, hybrid RAG, MCP lifecycle, synthesis, and workflow evaluation.
+- **Application-path tested:** authenticated API execution through LangGraph with Research, RAG, Analysis, Synthesis, persisted checkpoints, task introspection, and workflow evaluation.
+- **Production boundary:** Redis is required for asynchronous production submission; Redis failures return `503` rather than using an in-memory queue. A live API-to-Redis-to-worker test passed with PostgreSQL/pgvector, Redis, and the separate worker running under Docker.
+- **Known limitation:** Python thread-based task work cannot be force-cancelled. Timed-out work is marked terminal, late results are discarded, and the scheduler does not wait for the abandoned thread.
+
 ## Local Setup
 
 ### Prerequisites
@@ -235,7 +276,7 @@ Copy `.env.example` to `.env` and configure:
 ## Testing
 
 ```bash
-# Unit tests (352 tests; integration tests are skipped unless enabled)
+# Backend tests (382 tests; integration tests are skipped unless enabled)
 pytest -v
 
 # With coverage
@@ -252,7 +293,7 @@ cd frontend && npm test
 pytest tests/test_workflow.py -v
 ```
 
-> **Note:** The default `pytest` run reports `352 passed, 23 skipped`. The 23
+> **Note:** The default `pytest` run reports `382 passed, 23 skipped`. The 23
 > skipped are real-infrastructure integration tests that only run with
 > `AEGISFORGE_INTEGRATION_TESTS=true` (23 passing when services are up). The
 > frontend suite adds 35 component/behavioral tests via `npm test`. Real-LLM

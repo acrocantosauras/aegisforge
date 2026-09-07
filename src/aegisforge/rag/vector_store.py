@@ -70,6 +70,46 @@ class VectorStore(ABC):
         """Count entries, optionally filtered by organization."""
         ...
 
+    def lexical_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        organization_id: str = "",
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        """Keyword/lexical search over entry content (Phase 5).
+
+        Default implementation is unavailable; subclasses provide a
+        PostgreSQL-native (tsvector) or in-memory token implementation.
+        """
+        raise NotImplementedError("lexical_search is not implemented by this store")
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens (stop words kept out of relevance math)."""
+    import re
+
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    stop = {
+        "the", "and", "for", "are", "with", "this", "that", "from", "have",
+        "was", "were", "you", "your", "its", "will", "can", "has", "not",
+    }
+    return [t for t in tokens if t not in stop and len(t) > 1]
+
+
+def _token_overlap_score(query_tokens: list[str], content: str) -> float:
+    """Simple deterministic TF-IDF-lite overlap score in [0, 1]."""
+    if not query_tokens:
+        return 0.0
+    content_tokens = _tokenize(content)
+    if not content_tokens:
+        return 0.0
+    total = 0
+    for token in query_tokens:
+        total += content_tokens.count(token)
+    max_possible = len(content_tokens)
+    return min(1.0, total / max_possible) if max_possible else 0.0
+
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
@@ -157,6 +197,40 @@ class InMemoryVectorStore(VectorStore):
         if not organization_id:
             return len(self._entries)
         return sum(1 for eid in self._entries if self._org_map.get(eid.id, "") == organization_id)
+
+    def lexical_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        organization_id: str = "",
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        """Deterministic keyword search over entry content (in-memory)."""
+        if not query or not query.strip():
+            return []
+        query_tokens = _tokenize(query)
+        results: list[SearchResult] = []
+
+        for entry in self._entries:
+            if organization_id and self._org_map.get(entry.id, "") != organization_id:
+                continue
+            if metadata_filter and any(
+                entry.metadata.get(k) != v for k, v in metadata_filter.items()
+            ):
+                continue
+            score = _token_overlap_score(query_tokens, entry.content)
+            if score > 0:
+                results.append(
+                    SearchResult(
+                        id=entry.id,
+                        content=entry.content,
+                        score=score,
+                        metadata=entry.metadata,
+                    )
+                )
+
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[:top_k]
 
 
 class PgVectorStore(VectorStore):
@@ -365,6 +439,88 @@ class PgVectorStore(VectorStore):
                 session.close()
         except Exception:
             return 0
+
+    @staticmethod
+    def _ensure_tsvector_index(session: Any) -> None:
+        """Best-effort GIN index for lexical search; failure degrades to seq scan."""
+        try:
+            from sqlalchemy import text
+
+            session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_vector_embeddings_content_tsv "
+                    "ON vector_embeddings USING GIN (to_tsvector('english', content))"
+                )
+            )
+            session.commit()
+        except Exception as exc:
+            logger.debug("Could not create tsvector GIN index (non-fatal): %s", exc)
+            session.rollback()
+
+    def lexical_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        organization_id: str = "",
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        """PostgreSQL-native lexical search via tsvector/tsquery (Phase 5)."""
+        self._ensure_table()
+        if not query or not query.strip():
+            return []
+        try:
+            from sqlalchemy import text
+
+            session = self._session_factory()
+            try:
+                self._ensure_tsvector_index(session)
+                where_clauses: list[str] = []
+                params: dict[str, Any] = {
+                    "query_text": query,
+                    "top_k": top_k,
+                }
+                if organization_id:
+                    where_clauses.append("organization_id = :org_id")
+                    params["org_id"] = organization_id
+
+                where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+                sql = text(
+                    f"""
+                    SELECT id, content, metadata,
+                           ts_rank(to_tsvector('english', content),
+                                   plainto_tsquery('english', :query_text)) AS score
+                    FROM vector_embeddings
+                    WHERE {where_sql}
+                      AND to_tsvector('english', content) @@ plainto_tsquery('english', :query_text)
+                    ORDER BY score DESC
+                    LIMIT :top_k
+                    """
+                )
+                rows = session.execute(sql, params).fetchall()
+                results: list[SearchResult] = []
+                for row in rows:
+                    meta = row.metadata
+                    if isinstance(meta, str):
+                        meta = json.loads(meta) if meta else {}
+                    meta = meta or {}
+                    if metadata_filter and any(
+                        meta.get(k) != v for k, v in metadata_filter.items()
+                    ):
+                        continue
+                    results.append(
+                        SearchResult(
+                            id=row.id,
+                            content=row.content,
+                            score=float(row.score or 0.0),
+                            metadata=meta,
+                        )
+                    )
+                return results
+            finally:
+                session.close()
+        except Exception:
+            logger.exception("Failed to run pgvector lexical search")
+            return []
 
 
 def get_vector_store(

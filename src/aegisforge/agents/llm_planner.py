@@ -27,7 +27,12 @@ from aegisforge.llm.providers import ModelProvider
 logger = logging.getLogger(__name__)
 
 # Allowed agent types for plan validation
-ALLOWED_AGENT_TYPES = {t.value for t in AgentType}
+ALLOWED_AGENT_TYPES = {
+    AgentType.RESEARCH.value,
+    AgentType.RAG.value,
+    AgentType.ANALYSIS.value,
+    AgentType.SYNTHESIS.value,
+}
 
 # Maximum plan limits
 MAX_TASKS = 20
@@ -152,7 +157,7 @@ You must respond with valid JSON matching this exact schema:
         {
             "task_id": "task-<random_id>",
             "description": "Clear description of what this task does",
-            "assigned_agent_type": "research|rag|code|vision|evaluator",
+            "assigned_agent_type": "research|rag|analysis|synthesis",
             "input_data": {},
             "dependencies": [],
             "expected_output_description": "What this task should produce",
@@ -163,7 +168,7 @@ You must respond with valid JSON matching this exact schema:
 
 Rules:
 - Each task must have a unique task_id
-- assigned_agent_type must be one of: research, rag, code, vision, evaluator, planner
+- assigned_agent_type must be one of: research, rag, analysis, synthesis
 - dependencies reference other task_ids in the same plan
 - Do not create circular dependencies
 - Keep the plan focused and minimal

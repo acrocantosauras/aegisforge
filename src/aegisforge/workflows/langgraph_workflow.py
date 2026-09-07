@@ -12,9 +12,12 @@ from aegisforge.agents.planner import PlannerAgent
 from aegisforge.agents.rag_agent import RAGAgent
 from aegisforge.agents.research_agent import ResearchAgent
 from aegisforge.domain.models import (
+    AgentExecutionStatus,
     AgentResult,
+    AgentType,
     EvaluationResult,
     EvaluationVerdict,
+    ExecutionPlan,
     RequestStatus,
     RiskLevel,
 )
@@ -33,6 +36,11 @@ from aegisforge.workflows.checkpoint import (
     get_checkpoint_store,
 )
 from aegisforge.workflows.evaluation import ResultEvaluator
+from aegisforge.workflows.scheduler import (
+    AgentFactory,
+    ExecutionConfig,
+    MultiAgentExecutor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +66,21 @@ class _WorkflowContext:
         self.checkpointer: WorkflowCheckpointer | None = None
         self.approval_service: Any | None = None
         self.tracer: Tracer | None = None
+        self.mcp_lifecycle: Any | None = None
 
     def reset(self) -> None:
+        if self.mcp_lifecycle is not None:
+            try:
+                self.mcp_lifecycle.shutdown()
+            except Exception as exc:
+                logger.warning("Could not shut down MCP lifecycle: %s", exc)
         self.model_provider = None
         self.retrieval_service = None
         self.critic = None
         self.checkpointer = None
         self.approval_service = None
         self.tracer = None
+        self.mcp_lifecycle = None
 
 
 _ctx = _WorkflowContext()
@@ -75,6 +90,10 @@ def _build_registry() -> ToolRegistry:
     """Create and populate the tool registry for this workflow."""
     registry = ToolRegistry()
     registry.register(KnowledgeSearchTool())
+    from aegisforge.config import get_settings
+    from aegisforge.mcp.lifecycle import configure_mcp_registry
+
+    registry, _ctx.mcp_lifecycle = configure_mcp_registry(get_settings(), registry)
     return registry
 
 
@@ -111,6 +130,35 @@ def _save_checkpoint_if_available(
     except Exception as exc:
         logger.warning("Failed to save checkpoint for node %s: %s", node_name, exc)
         return None
+
+
+def _plan_has_tasks(state: dict[str, Any]) -> bool:
+    return bool(state.get("plan", {}).get("tasks"))
+
+
+def _is_multi_agent_run(state: dict[str, Any]) -> bool:
+    """A run uses the dependency-aware engine when its plan needs it.
+
+    The engine is required when the plan carries explicit dependency edges,
+    references between tasks, analysis/synthesis agents, or a run already
+    produced ``task_records`` (resume).  Plain multi-task serial plans
+    (e.g. legacy Phase 4.2 states without dependencies) keep the classic
+    serial path so their semantics are preserved exactly.
+    """
+    if state.get("task_records"):
+        return True
+    tasks = state.get("plan", {}).get("tasks", [])
+    for task in tasks:
+        if task.get("dependencies"):
+            return True
+        if task.get("input_references") or task.get("evidence_from") or task.get("agent_outputs_from"):
+            return True
+        if str(task.get("assigned_agent_type", "")) in (
+            AgentType.ANALYSIS.value,
+            AgentType.SYNTHESIS.value,
+        ):
+            return True
+    return False
 
 
 # --- Graph Nodes ---
@@ -243,6 +291,270 @@ def execute_agent_node(state: dict[str, Any]) -> dict[str, Any]:
     )
     _save_checkpoint_if_available(_ctx.checkpointer, "execute_agent", result_state)
     return result_state
+
+
+def _pick_final_agent_result(
+    records: dict[str, Any],
+    plan: ExecutionPlan,
+) -> dict[str, Any] | None:
+    """Choose the workflow's final agent result for evaluation/display.
+
+    Prefers a completed synthesis task, then the last completed task in
+    dependency order.  Returns None when nothing completed.
+    """
+    completed = [
+        tid for tid, rec in records.items()
+        if rec.get("status") == AgentExecutionStatus.COMPLETED.value
+    ]
+    if not completed:
+        return None
+
+    for tid in completed:
+        if str(records[tid].get("agent_type", "")) == AgentType.SYNTHESIS.value:
+            return records[tid]
+
+    order: list[str] = []
+    visited: set[str] = set()
+    task_map = {t.task_id: t for t in plan.tasks}
+
+    def _visit(tid: str) -> None:
+        if tid in visited:
+            return
+        visited.add(tid)
+        task = task_map.get(tid)
+        for dep in (task.dependencies if task else []):
+            _visit(dep)
+        order.append(tid)
+
+    for tid in completed:
+        _visit(tid)
+    for tid in reversed(order):
+        if tid in completed:
+            return records[tid]
+    return records[completed[-1]]
+
+
+def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Execute a multi-task plan with the dependency-aware engine.
+
+    Runs the whole plan (parallel waves where dependencies allow, per-task
+    retries/timeouts, partial-failure policies), pauses for human approval
+    at task gates when an approval service is configured, then hands the
+    final result to the evaluation stage.
+    """
+    from aegisforge.config import get_settings
+
+    plan_dict = state.get("plan", {})
+    try:
+        plan = ExecutionPlan(**plan_dict)
+    except Exception as exc:
+        return _copy_state(
+            state,
+            status=RequestStatus.FAILED.value,
+            errors=list(state.get("errors", [])) + [f"Multi-agent plan invalid: {exc}"],
+        )
+
+    settings = get_settings()
+    config = ExecutionConfig(
+        max_concurrency=max(1, settings.max_parallel_tasks),
+        default_task_timeout_seconds=settings.task_default_timeout_seconds,
+        default_max_retries=settings.task_default_max_retries,
+    )
+    factory = AgentFactory(
+        retrieval_service=_ctx.retrieval_service,
+        model_provider=_ctx.model_provider,
+        tool_registry=_build_registry(),
+    )
+
+    collected_audit: list[dict[str, Any]] = []
+
+    def _audit(action: str, resource_type: str, meta: dict[str, Any]) -> None:
+        collected_audit.append(
+            {
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": state.get("workflow_id", ""),
+                "outcome": "success",
+                "metadata": meta,
+            }
+        )
+
+    def _checkpoint(snapshot: dict[str, Any]) -> None:
+        if _ctx.checkpointer is None:
+            return
+        full_snapshot = dict(state)
+        full_snapshot["task_records"] = snapshot.get("task_records", {})
+        full_snapshot["errors"] = list(state.get("errors", [])) + list(snapshot.get("errors", []))
+        _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", full_snapshot)
+
+    approved_task_ids = set(state.get("approved_task_ids", []) or [])
+    executor = MultiAgentExecutor(
+        config=config,
+        agent_factory=factory,
+        approval_service=_ctx.approval_service,
+        checkpoint_callback=_checkpoint,
+        audit_callback=_audit,
+        tracer=_ctx.tracer,
+    )
+
+    try:
+        outcome = executor.execute(
+            plan,
+            request_id=state.get("request_id", ""),
+            workflow_id=state.get("workflow_id", ""),
+            organization_id=state.get("organization_id", ""),
+            user_id=state.get("user_id", ""),
+            intent=state.get("intent", ""),
+            job_id=state.get("job_id", ""),
+            preexisting_records=state.get("task_records", {}) or {},
+            approved_task_ids=approved_task_ids,
+        )
+    except Exception as exc:
+        logger.exception("Multi-agent execution failed for workflow %s", state.get("workflow_id"))
+        return _copy_state(
+            state,
+            status=RequestStatus.FAILED.value,
+            errors=list(state.get("errors", [])) + [f"Multi-agent execution error: {exc}"],
+            audit_events=list(state.get("audit_events", [])) + collected_audit,
+        )
+
+    records = outcome.record_dicts
+    tool_calls: list[dict[str, Any]] = []
+    for rec in records.values():
+        tool_calls.extend(rec.get("tool_calls", []) or [])
+    existing_tool_calls = list(state.get("tool_calls", []))
+    all_tool_calls = existing_tool_calls + tool_calls
+
+    # Paused for human approval at a task boundary.
+    if outcome.status == RequestStatus.ACTION_REQUIRES_APPROVAL:
+        result_state = _copy_state(
+            state,
+            status=RequestStatus.ACTION_REQUIRES_APPROVAL.value,
+            approval_required=True,
+            approval_risk_level="high",
+            approval_id=outcome.approval_id,
+            approval_task_id=outcome.approval_task_id,
+            approval_action=next(
+                (t.description for t in plan.tasks if t.task_id == outcome.approval_task_id),
+                "Multi-agent task execution",
+            ),
+            task_records=records,
+            tool_calls=all_tool_calls,
+            audit_events=list(state.get("audit_events", [])) + collected_audit,
+            errors=list(state.get("errors", [])) + outcome.errors,
+        )
+        _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", result_state)
+        return result_state
+
+    # Final agent result for evaluation/display.
+    final_record = _pick_final_agent_result(records, plan)
+    if final_record is None:
+        result_state = _copy_state(
+            state,
+            status=RequestStatus.FAILED.value,
+            agent_result={
+                "agent_name": "",
+                "agent_type": "",
+                "status": AgentExecutionStatus.FAILED.value,
+                "summary": "All tasks failed; no final result produced",
+                "result": {},
+                "errors": outcome.errors,
+            },
+            task_records=records,
+            multi_agent_summary=outcome.summary.model_dump(),
+            tool_calls=all_tool_calls,
+            audit_events=list(state.get("audit_events", [])) + collected_audit,
+            errors=list(state.get("errors", [])) + outcome.errors,
+        )
+        _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", result_state)
+        return result_state
+
+    answer = final_record.get("output", {}).get("answer", final_record.get("summary", ""))
+    final_errors = (
+        outcome.errors
+        if outcome.status == RequestStatus.FAILED
+        else []
+    )
+    agent_result = {
+        "agent_name": final_record.get("task_id", ""),
+        "agent_type": final_record.get("agent_type", "synthesis"),
+        "status": (
+            AgentExecutionStatus.FAILED.value
+            if outcome.status == RequestStatus.FAILED
+            else AgentExecutionStatus.COMPLETED.value
+        ),
+        "summary": final_record.get("summary", ""),
+        "result": {
+            "query": state.get("intent", ""),
+            "answer": answer,
+            "task_id": final_record.get("task_id", ""),
+            "citations": final_record.get("output", {}).get("citations", []),
+            "failed_upstream": final_record.get("output", {}).get("failed_upstream", []),
+        },
+        "evidence": final_record.get("evidence", []),
+        "tool_calls": final_record.get("tool_calls", []),
+        "errors": final_errors,
+        "confidence": final_record.get("output", {}).get("confidence"),
+    }
+
+    # A partially-failed run is failed: its (possibly partial) result is kept
+    # for reporting, but the run never silently claims full completion.
+    run_status = (
+        RequestStatus.FAILED.value
+        if outcome.status == RequestStatus.FAILED
+        else RequestStatus.EVALUATING.value
+    )
+    result_state = _copy_state(
+        state,
+        status=run_status,
+        agent_result=agent_result,
+        current_task_index=max(len(plan.tasks) - 1, 0),
+        task_records=records,
+        multi_agent_summary=outcome.summary.model_dump(),
+        tool_calls=all_tool_calls,
+        audit_events=list(state.get("audit_events", [])) + collected_audit,
+        errors=list(state.get("errors", [])) + outcome.errors,
+    )
+    # Workflow-level evaluation (planning/collaboration/final-response).
+    try:
+        from aegisforge.evaluation.workflow_evaluator import evaluate_workflow_run
+        from aegisforge.observability.metrics import record_workflow_evaluation_score
+
+        wf_eval = evaluate_workflow_run(
+            plan,
+            records,
+            final_output=agent_result.get("result") or {},
+        )
+        result_state["workflow_evaluation"] = wf_eval.to_dict()
+        try:
+            verdict = "failed" if run_status == RequestStatus.FAILED.value else "passed"
+            record_workflow_evaluation_score(verdict, wf_eval.overall_score)
+        except Exception:  # noqa: S110 - observability must never break execution
+            pass
+    except Exception as exc:
+        logger.warning("Workflow evaluation failed (non-fatal): %s", exc)
+    _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", result_state)
+    return result_state
+
+
+def route_after_plan(state: dict[str, Any]) -> str:
+    """Multi-task plans go through the dependency engine; single tasks stay
+    on the classic serial path."""
+    if _is_multi_agent_run(state):
+        return "multi_agent"
+    return "execute_agent"
+
+
+def route_after_multi_agent(state: dict[str, Any]) -> str:
+    """Route from the multi-agent node based on resulting status."""
+    status = state.get("status", "")
+    if status in (RequestStatus.COMPLETED.value, RequestStatus.FAILED.value):
+        return "end"
+    if status == RequestStatus.EVALUATING.value:
+        return "evaluate"
+    if status == RequestStatus.ACTION_REQUIRES_APPROVAL.value:
+        return "end"
+    return "end"
 
 
 def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -462,13 +774,19 @@ def _traced_node(fn: Any, name: str) -> Any:
 
 
 def build_execution_graph() -> StateGraph:
-    """Build the LangGraph workflow graph."""
+    """Build the LangGraph workflow graph.
+
+    Multi-task (multi-agent) plans route through the dependency-aware
+    scheduler; single-task plans keep the classic linear path so that
+    Phase 0–4 behavior is unchanged.
+    """
     graph = StateGraph(dict)  # type: ignore[type-var]
 
     # Add nodes (wrapped with tracing when a tracer is active)
     graph.add_node("validate_request", _traced_node(validate_request_node, "validate_request"))
     graph.add_node("plan", _traced_node(plan_node, "plan"))
     graph.add_node("execute_agent", _traced_node(execute_agent_node, "execute_agent"))
+    graph.add_node("multi_agent_execute", _traced_node(multi_agent_execute_node, "multi_agent_execute"))
     graph.add_node("evaluate", _traced_node(evaluate_node, "evaluate"))
     graph.add_node("retry_or_complete", _traced_node(retry_or_complete_node, "retry_or_complete"))
 
@@ -477,9 +795,28 @@ def build_execution_graph() -> StateGraph:
 
     # Linear edges
     graph.add_edge("validate_request", "plan")
-    graph.add_edge("plan", "execute_agent")
     graph.add_edge("execute_agent", "evaluate")
     graph.add_edge("evaluate", "retry_or_complete")
+
+    # After planning, route multi-task plans to the dependency engine.
+    graph.add_conditional_edges(
+        "plan",
+        route_after_plan,
+        {
+            "execute_agent": "execute_agent",
+            "multi_agent": "multi_agent_execute",
+        },
+    )
+
+    # After the multi-agent engine finishes.
+    graph.add_conditional_edges(
+        "multi_agent_execute",
+        route_after_multi_agent,
+        {
+            "evaluate": "evaluate",
+            "end": END,
+        },
+    )
 
     # Conditional edge from retry_or_complete
     graph.add_conditional_edges(
@@ -495,7 +832,14 @@ def build_execution_graph() -> StateGraph:
 
 
 # Nodes that should be checkpointed
-_CHECKPOINTABLE_NODES = {"validate_request", "plan", "execute_agent", "evaluate", "retry_or_complete"}
+_CHECKPOINTABLE_NODES = {
+    "validate_request",
+    "plan",
+    "execute_agent",
+    "multi_agent_execute",
+    "evaluate",
+    "retry_or_complete",
+}
 
 
 def _build_wrapped_node(
@@ -638,15 +982,29 @@ def _resume_after_approval(
 ) -> dict[str, Any]:
     """Continue a workflow after an approval decision.
 
-    The approved task has already executed; advance to the next task
-    (or complete) without re-running the approved task and without
-    re-creating its approval.
+    Legacy (single-task) runs: the approved task has already executed;
+    advance to the next task without re-running it and without re-creating
+    its approval.
+
+    Multi-agent runs: the gated task has NOT executed yet (the engine pauses
+    *before* running a task that needs approval).  We mark that task as
+    approved and let the dependency engine continue from the checkpoint,
+    skipping tasks that already completed.
     """
     state["status"] = RequestStatus.EXECUTING.value
     state["approval_required"] = False
     state["approval_resolved"] = True
     state["resumed"] = True
     state.pop("approval_id", None)
+
+    if _is_multi_agent_run(state):
+        approved = set(state.get("approved_task_ids", []) or [])
+        gated_task_id = state.get("approval_task_id", "")
+        if gated_task_id:
+            approved.add(gated_task_id)
+        state["approved_task_ids"] = sorted(approved)
+        state.pop("approval_task_id", None)
+        return _execute_with_state(state, workflow_id, checkpointer)
 
     tasks = state.get("plan", {}).get("tasks", [])
     next_index = int(state.get("current_task_index", 0)) + 1

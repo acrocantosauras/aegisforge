@@ -61,7 +61,14 @@ def _create_job_handler(settings: Settings) -> Any:
         """Persist job lifecycle state to the database (source of truth)."""
         from aegisforge.db.models import ExecutionJobModel
 
-        job_model = db.query(ExecutionJobModel).filter(ExecutionJobModel.id == job.job_id).first()
+        job_model = (
+            db.query(ExecutionJobModel)
+            .filter(
+                ExecutionJobModel.id == job.job_id,
+                ExecutionJobModel.organization_id == job.organization_id,
+            )
+            .first()
+        )
         if job_model is None:
             return
         job_model.status = status
@@ -82,10 +89,20 @@ def _create_job_handler(settings: Settings) -> Any:
             from aegisforge.db.models import RequestModel
 
             organization_id = job.organization_id or ""
-            request = db.query(RequestModel).filter(RequestModel.id == job.request_id).first()
+            if not organization_id:
+                raise ValueError(f"Job {job.job_id} is missing an organization")
+            request = (
+                db.query(RequestModel)
+                .filter(
+                    RequestModel.id == job.request_id,
+                    RequestModel.organization_id == organization_id,
+                )
+                .first()
+            )
             if request is None:
-                raise ValueError(f"Request {job.request_id} not found")
-            organization_id = organization_id or request.organization_id
+                raise ValueError(
+                    f"Request {job.request_id} not found for organization {organization_id}"
+                )
 
             # Persist job status: queued -> running
             _update_job_model(db, job, ExecutionJobStatus.RUNNING.value)
@@ -243,10 +260,24 @@ def _create_retrieval_service(settings: Settings) -> Any:
             dimension=settings.embedding_dimension,
         )
 
-        return RetrievalService(
+        retrieval_service: Any = RetrievalService(
             embedding_provider=embedding_provider,
             vector_store=vector_store,
         )
+        if settings.rag_hybrid_enabled:
+            from aegisforge.rag.hybrid import build_hybrid_retrieval_adapter
+
+            retrieval_service = build_hybrid_retrieval_adapter(
+                retrieval_service,
+                vector_store,
+                reranker_type=settings.rag_reranker,
+                query_expansion_enabled=settings.rag_query_expansion_enabled,
+                query_expansion_max=settings.rag_query_expansion_max,
+                fusion_candidates=settings.rag_fusion_candidates,
+                lexical_top_k=settings.rag_lexical_top_k,
+                context_max_tokens=settings.rag_context_max_tokens,
+            )
+        return retrieval_service
     except Exception as exc:
         if is_production and settings.database_url.startswith("postgresql"):
             logger.critical(

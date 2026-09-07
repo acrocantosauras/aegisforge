@@ -125,6 +125,58 @@ try:
         buckets=[1, 5, 10, 30, 60, 300, 600, 3600],
     )
 
+    # Phase 5 — multi-agent execution metrics
+    TASK_EXECUTIONS_TOTAL = Counter(
+        "task_executions_total",
+        "Total multi-agent task executions",
+        ["agent_type", "status"],
+    )
+    TASK_RETRIES_TOTAL = Counter(
+        "task_retries_total",
+        "Total multi-agent task retries",
+        ["agent_type"],
+    )
+    TASK_DURATION = Histogram(
+        "task_duration_seconds",
+        "Multi-agent task duration",
+        ["agent_type"],
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+    )
+    TASK_CONCURRENCY = Histogram(
+        "task_concurrency",
+        "Concurrency level observed during task waves",
+        buckets=[1, 2, 3, 4, 5, 8, 10, 16],
+    )
+    WORKFLOW_EVALUATION_SCORE = Gauge(
+        "workflow_evaluation_score",
+        "Workflow evaluation score",
+        ["verdict"],
+    )
+
+    # Phase 5 — MCP ecosystem health metrics (bounded server_id label set)
+    MCP_SERVER_STATUS_TOTAL = Counter(
+        "mcp_server_status_total",
+        "MCP server status transitions",
+        ["server_id", "status"],
+    )
+
+    # Phase 5 — hybrid RAG metrics
+    RAG_HYBRID_RETRIEVAL_TOTAL = Counter(
+        "rag_hybrid_retrieval_total",
+        "Total hybrid retrievals",
+        ["reranker"],
+    )
+    RAG_HYBRID_LATENCY = Histogram(
+        "rag_hybrid_latency_seconds",
+        "Hybrid retrieval latency",
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
+    )
+    RAG_QUERY_EXPANSIONS = Histogram(
+        "rag_query_expansions",
+        "Queries issued per retrieval (1 = no expansion)",
+        buckets=[1, 2, 3, 4, 5],
+    )
+
     # Job queue metrics
     QUEUE_DEPTH = Gauge(
         "queue_depth",
@@ -303,6 +355,61 @@ def record_workflow_retry() -> None:
     if not HAS_PROMETHEUS:
         return
     WORKFLOW_RETRIES_TOTAL.inc()
+
+
+def record_task_execution(
+    agent_type: str,
+    status: str,
+    duration_ms: int | None = None,
+) -> None:
+    """Record a multi-agent task execution (low-cardinality agent_type)."""
+    if not HAS_PROMETHEUS:
+        return
+    TASK_EXECUTIONS_TOTAL.labels(agent_type=agent_type, status=status).inc()
+    if duration_ms is not None and duration_ms > 0:
+        TASK_DURATION.labels(agent_type=agent_type).observe(duration_ms / 1000.0)
+
+
+def record_task_retry(agent_type: str) -> None:
+    """Record a multi-agent task retry."""
+    if not HAS_PROMETHEUS:
+        return
+    TASK_RETRIES_TOTAL.labels(agent_type=agent_type).inc()
+
+
+def record_task_concurrency(level: int) -> None:
+    """Record the concurrency level observed during a task wave."""
+    if not HAS_PROMETHEUS:
+        return
+    TASK_CONCURRENCY.observe(max(level, 1))
+
+
+def record_workflow_evaluation_score(verdict: str, score: float) -> None:
+    """Record the workflow evaluation score by verdict (low-cardinality)."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKFLOW_EVALUATION_SCORE.labels(verdict=verdict).set(max(0.0, min(1.0, score)))
+
+
+def record_mcp_server_status(server_id: str, status: str) -> None:
+    """Record an MCP server health/lifecycle status transition.
+
+    ``server_id`` comes from the (operator-controlled) server catalog and is
+    therefore bounded and low-cardinality — never from user input.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    MCP_SERVER_STATUS_TOTAL.labels(server_id=server_id, status=status).inc()
+
+
+def record_rag_hybrid_retrieval(response: Any) -> None:
+    """Record hybrid retrieval metrics from a HybridRetrievalResponse."""
+    if not HAS_PROMETHEUS:
+        return
+    reranker = getattr(getattr(response, "rerank_stats", None), "reranker", "none")
+    RAG_HYBRID_RETRIEVAL_TOTAL.labels(reranker=reranker).inc()
+    RAG_HYBRID_LATENCY.observe(max(getattr(response, "latency_ms", 0) / 1000.0, 0.0))
+    RAG_QUERY_EXPANSIONS.observe(max(len(getattr(response, "expansions", []) or []), 1))
 
 
 def set_queue_depth(depth: int) -> None:

@@ -12,6 +12,8 @@ from aegisforge.api.routes.evaluation import router as evaluation_router
 from aegisforge.api.routes.execution import router as execution_router
 from aegisforge.api.routes.health import router as health_router
 from aegisforge.api.routes.requests import router as requests_router
+from aegisforge.api.routes.tools import router as tools_router
+from aegisforge.api.routes.workflows import router as workflows_router
 from aegisforge.config import Settings, get_settings
 from aegisforge.config import get_settings as _get_settings
 from aegisforge.db.session import get_db, get_session_factory
@@ -108,6 +110,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(approvals_router, prefix=settings.api_prefix)
     app.include_router(evaluation_router, prefix=settings.api_prefix)
     app.include_router(audit_router, prefix=settings.api_prefix)
+    app.include_router(tools_router, prefix=settings.api_prefix)
+    app.include_router(workflows_router, prefix=settings.api_prefix)
 
     # Prometheus metrics endpoint
     @app.get("/metrics")

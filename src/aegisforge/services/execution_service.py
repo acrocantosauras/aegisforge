@@ -53,6 +53,19 @@ def _build_dependencies(settings: Settings | None = None):  # type: ignore[no-un
             embedding_provider=embedding_provider,
             vector_store=vector_store,
         )
+        if settings.rag_hybrid_enabled:
+            from aegisforge.rag.hybrid import build_hybrid_retrieval_adapter
+
+            retrieval_service = build_hybrid_retrieval_adapter(
+                retrieval_service,
+                vector_store,
+                reranker_type=settings.rag_reranker,
+                query_expansion_enabled=settings.rag_query_expansion_enabled,
+                query_expansion_max=settings.rag_query_expansion_max,
+                fusion_candidates=settings.rag_fusion_candidates,
+                lexical_top_k=settings.rag_lexical_top_k,
+                context_max_tokens=settings.rag_context_max_tokens,
+            )
     except Exception as exc:
         if is_production and settings.database_url.startswith("postgresql"):
             logger.critical(
@@ -408,7 +421,26 @@ def resume_request_after_approval(
 def _persist_agent_executions(
     db: Session, request_id: str, state: dict[str, Any]
 ) -> None:
-    """Persist agent execution records from workflow state."""
+    """Persist agent execution records from workflow state.
+
+    Multi-agent runs persist one record per task (from ``task_records``);
+    the classic single-agent path persists the single ``agent_result``.
+    """
+    task_records = state.get("task_records", {}) or {}
+    if task_records:
+        for task_id, record in task_records.items():
+            execution = AgentExecutionModel(
+                id=str(uuid.uuid4()),
+                request_id=request_id,
+                agent_id=task_id,
+                agent_name=str(record.get("agent_type", task_id)),
+                status=str(record.get("status", "unknown")),
+                result=json.dumps(record),
+            )
+            db.add(execution)
+        db.commit()
+        return
+
     agent_result_dict = state.get("agent_result", {})
     if not agent_result_dict:
         return
@@ -442,22 +474,42 @@ def _persist_tool_executions(
 
 
 def _persist_tasks(db: Session, request_id: str, state: dict[str, Any]) -> None:
-    """Persist task records from the execution plan (idempotent)."""
+    """Persist task records from the execution plan (idempotent).
+
+    Multi-agent runs persist accurate per-task statuses from
+    ``task_records``; the classic single-agent path records every planned
+    task as completed (as before).
+    """
     plan = state.get("plan", {})
     tasks = plan.get("tasks", [])
+    task_records = state.get("task_records", {}) or {}
+
     for task_dict in tasks:
         task_id = task_dict.get("task_id", "")
-        # Idempotent: skip tasks already persisted (e.g. resume after approval)
-        if task_id and db.query(TaskModel).filter(TaskModel.id == task_id).first() is not None:
-            continue
-        task = TaskModel(
-            id=task_id or str(uuid.uuid4()),
-            request_id=request_id,
-            title=task_dict.get("description", "")[:255],
-            description=task_dict.get("description", ""),
-            agent_type=task_dict.get("assigned_agent_type", "research"),
-            status="completed",
-            dependencies=json.dumps(task_dict.get("dependencies", [])),
-        )
-        db.add(task)
+        if not task_id:
+            task_id = str(uuid.uuid4())
+        record = task_records.get(task_id, {})
+        status = str(record.get("status", "completed")) if task_records else "completed"
+        agent_type = task_dict.get("assigned_agent_type", "research")
+        dependencies = json.dumps(task_dict.get("dependencies", []))
+
+        existing = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+        if existing is not None:
+            existing.status = status
+            existing.agent_type = agent_type
+            existing.title = task_dict.get("description", "")[:255]
+            existing.description = task_dict.get("description", "")
+            existing.dependencies = dependencies
+        else:
+            db.add(
+                TaskModel(
+                    id=task_id,
+                    request_id=request_id,
+                    title=task_dict.get("description", "")[:255],
+                    description=task_dict.get("description", ""),
+                    agent_type=agent_type,
+                    status=status,
+                    dependencies=dependencies,
+                )
+            )
     db.commit()

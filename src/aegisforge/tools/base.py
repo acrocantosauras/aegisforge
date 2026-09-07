@@ -57,6 +57,12 @@ class ToolDefinition:
     permission_requirements: list[str] = field(default_factory=list)
     timeout_seconds: int = 30
     requires_approval: bool = False
+    # Phase 5 — risk classification. Server/operator-controlled metadata:
+    # the planner/LLM can never downgrade these values.
+    risk_level: str = "low"  # low | medium | high | critical
+    read_only: bool = True
+    external_side_effect: bool = False
+    data_sensitivity: str = "internal"  # internal | confidential | restricted
 
 
 # --- Tool Execution Result ---

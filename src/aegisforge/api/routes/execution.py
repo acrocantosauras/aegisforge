@@ -117,6 +117,26 @@ def execute_request_async(
 
     workflow_id = f"wf-{uuid.uuid4().hex[:12]}"
 
+    # Verify the queue before creating durable records. Production execution
+    # must never accept a job that cannot reach the Redis-backed worker.
+    from aegisforge.async_execution.jobs import JobQueue as _JobQueue
+
+    queue: _JobQueue
+    try:
+        import redis as redis_lib
+
+        redis_client = redis_lib.from_url(settings.redis_url, decode_responses=True)
+        redis_client.ping()
+        queue = RedisJobQueue(redis_client)
+    except Exception as exc:
+        is_production = settings.environment not in ("development", "test", "")
+        if is_production:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Asynchronous execution is unavailable because Redis is not reachable",
+            ) from exc
+        queue = InMemoryJobQueue()
+
     # Create job record in database
     job_id = f"job-{uuid.uuid4().hex[:12]}"
     job_model = ExecutionJobModel(
@@ -139,19 +159,6 @@ def execute_request_async(
     db.add(workflow_model)
     db.commit()
 
-    # Submit to Redis queue
-    from aegisforge.async_execution.jobs import JobQueue as _JobQueue
-
-    queue: _JobQueue
-    try:
-        import redis as redis_lib
-
-        redis_client = redis_lib.from_url(settings.redis_url, decode_responses=True)
-        redis_client.ping()
-        queue = RedisJobQueue(redis_client)
-    except Exception:
-        queue = InMemoryJobQueue()
-
     job_manager = JobManager(queue)
     from aegisforge.domain.models import ExecutionJob, ExecutionJobStatus
 
@@ -166,7 +173,13 @@ def execute_request_async(
         trace_id=trace_id,
     )
     job_manager._jobs[job_id] = job
-    queue.enqueue(job)
+    if not queue.enqueue(job):
+        job_model.status = "failed"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Asynchronous execution could not be queued",
+        )
     record_queue_event("queued")
     set_queue_depth(queue.size())
 

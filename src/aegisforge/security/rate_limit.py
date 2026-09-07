@@ -26,9 +26,6 @@ from aegisforge.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# In-memory fallback storage: {bucket_key: (window_start, count)}
-_fallback_store: dict[str, tuple[int, int]] = {}
-
 _redis_client: Any = None
 _redis_available = False
 
@@ -36,6 +33,8 @@ _redis_available = False
 def _get_redis(settings: Settings) -> Any:
     """Lazily connect to Redis."""
     global _redis_client, _redis_available
+    if settings.environment == "test":
+        return None
     if _redis_client is None:
         try:
             import redis as redis_lib
@@ -97,6 +96,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._max_requests = settings.rate_limit_max_requests
         self._auth_max_requests = settings.rate_limit_auth_max_requests
         self._window_seconds = settings.rate_limit_window_seconds
+        # Keep fallback counters scoped to this middleware instance so separate
+        # app instances cannot share counts or configuration accidentally.
+        self._fallback_store: dict[str, tuple[int, int]] = {}
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         if not self._settings.rate_limit_enabled:
@@ -121,16 +123,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     redis.expire(bucket, self._window_seconds + 1)
             else:
                 bucket_key = f"{key}:{window_start}"
-                prev_start, prev_count = _fallback_store.get(bucket_key, (window_start, 0))
+                prev_start, prev_count = self._fallback_store.get(bucket_key, (window_start, 0))
                 if prev_start != window_start:
                     count = 1
-                    _fallback_store[bucket_key] = (window_start, count)
+                    self._fallback_store[bucket_key] = (window_start, count)
                 else:
                     count = prev_count + 1
-                    _fallback_store[bucket_key] = (window_start, count)
+                    self._fallback_store[bucket_key] = (window_start, count)
                 # Bound the in-memory store so it cannot grow unbounded
-                if len(_fallback_store) > 10_000:
-                    _fallback_store.clear()
+                if len(self._fallback_store) > 10_000:
+                    self._fallback_store.clear()
 
             if count > limit:
                 return JSONResponse(

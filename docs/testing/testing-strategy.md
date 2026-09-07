@@ -168,7 +168,7 @@
 - Mock MCP client for tool integration testing
 - In-memory job queue for async execution testing
 - In-memory checkpoint store for workflow checkpointing testing
-- 352 unit tests pass; 23 real-infrastructure integration tests run opt-in via `AEGISFORGE_INTEGRATION_TESTS=true`; 35 frontend tests via `npm test`
+- 382 backend tests pass; 23 real-infrastructure integration tests run opt-in via `AEGISFORGE_INTEGRATION_TESTS=true`; 35 frontend tests via `npm test`
 
 ## Phase 4 Test Additions
 
@@ -193,7 +193,7 @@
 ## Running Tests
 
 ```bash
-# All unit tests (352 tests; integration tests skipped unless enabled)
+# All backend tests (382 passed; integration tests skipped unless enabled)
 python -m pytest tests/ -v
 
 # Specific test file
@@ -202,3 +202,23 @@ python -m pytest tests/test_tools.py -v
 # With coverage
 python -m pytest tests/ --cov=aegisforge --cov-report=term-missing
 ```
+
+## Phase 5 Test Additions
+
+### Multi-Agent Execution (`test_phase5_multi_agent.py`)
+- dependency-aware DAG validation and execution waves
+- bounded parallel execution and dependency ordering
+- inter-agent evidence and structured output passing
+- retries, timeouts, partial failure policies, and approval pause/resume
+- checkpoint snapshots and late-timeout result protection
+
+### Production-Path Coverage (`test_phase5_e2e.py`)
+- authenticated API request through LangGraph and the multi-agent scheduler
+- Research/RAG parallel tasks followed by Analysis and Synthesis
+- persisted task introspection and workflow-level evaluation
+- production async submission fails closed when Redis is unavailable
+
+The Phase 5 application-path test uses deterministic providers and SQLite for
+repeatability. The live API -> Redis -> worker -> PostgreSQL test was also
+validated with the Docker services running; it completed through LangGraph,
+Research, Analysis, Synthesis, Evaluation, and checkpoint-backed introspection.
