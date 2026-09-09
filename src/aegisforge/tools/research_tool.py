@@ -17,7 +17,7 @@ class ResearchTool(BaseTool):
         )
         super().__init__(definition)
 
-    def _execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    def _execute(self, input_data: dict[str, Any], context: Any | None = None) -> dict[str, Any]:
         query = str(input_data.get("query", ""))
         return {
             "answer": f"Approved internal guidance for '{query}' indicates a documented review process before final recommendation.",
