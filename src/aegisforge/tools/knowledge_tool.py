@@ -85,7 +85,9 @@ class KnowledgeSearchTool(BaseTool):
         super().__init__(definition)
         self._kb = _KNOWLEDGE_BASE
 
-    def _execute(self, input_data: dict[str, Any]) -> dict[str, str]:
+    def _execute(
+        self, input_data: dict[str, Any], context: Any | None = None
+    ) -> dict[str, str]:
         query = str(input_data.get("query", "")).lower().strip()
         if not query:
             return {"topic": "", "summary": "Empty query provided.", "source": "", "last_reviewed": ""}

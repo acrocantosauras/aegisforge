@@ -193,9 +193,59 @@ redundancy, and final-response quality.
 - Real PostgreSQL/pgvector hybrid retrieval integration tests covering vector, lexical, fusion, reranking, context/citation preservation, and tenant filtering
 
 #### MCP Operations
-- Registered MCP server and tool catalogs with public metadata only
-- Connection lifecycle management and health monitoring
-- Configured tool allow-lists and existing permission/risk/approval controls
+- Registered MCP server and tool catalogs with public metadata only (no secrets)
+- Connection lifecycle management, bounded reconnect, and health monitoring
+- Configured tool allow-lists with existing permission/risk/approval controls
+- Explicit MCP lifecycle, unhealthy-server, timeout, and failure-mode behavior tested with the existing `MockMCPClient`
+
+#### MCP Tool Discovery, Permission, Risk, and Approval Flow
+
+The MCP ecosystem is an integration boundary in the execution path, not a way to
+let the LLM invent capabilities. The runtime path is:
+
+User Request
+  ↓
+Planner creates a validated ExecutionPlan (untrusted input is re-validated before execution)
+  ↓
+Scheduler resolves each task's effective tool_name from the MCP catalog/registry
+  ↓
+Permission check runs before any tool executes (deny-by-default)
+  ↓
+Risk classification is read from operator-controlled server/tool metadata only (never from LLM input)
+  ↓
+If risk requires approval and no approval exists, the workflow pauses at the task gate
+  ↓
+MCPToolAdapter executes the real MCP tool through the MCP client with the server timeout
+  ↓
+Structured ToolExecutionResult is returned; timeouts/failures are explicit, not silent success
+  ↓
+Evaluation, retries, approval resume, and audit events continue as normal
+
+Key rules baked into the current implementation:
+
+- Unknown, disabled, and disallowed MCP tools cannot be selected or executed.
+- Tool risk/approval metadata comes from the server catalog config, so the planner cannot downgrade risk for a tool it requests.
+- Catalog and MCP tool APIs expose metadata only. Secrets stay in environment/secret configuration.
+- MCP server health and lifecycle failures are isolated; one unhealthy MCP server does not make the platform treat every MCP tool as healthy.
+- Timeouts are explicit: an MCP tool timeout becomes a `timeout` result/status, not a fake success.
+
+Concrete example (happy path):
+
+1. Operator configures a stdio MCP server `mcp.example` with `allowed_tools: [lookup]` and `risk_level: medium`.
+2. The catalog registers that server; the lifecycle manager connects it and discovers its tools.
+3. Only `lookup` enters the catalog because `allowed_tools` filters everything else.
+4. A planner task references `mcp.mcp.example.lookup`; the scheduler resolves that against the catalog.
+5. `lookup` is registered as `mcp.mcp.example.lookup` with permission requirement `mcp.mcp.example`.
+6. Before execution, the registry checks whether the agent context has `mcp.mcp.example`. If not, execution is denied.
+7. If execution is allowed, the MCPToolAdapter invokes the tool through the MCP client with the configured timeout.
+8. If the tool returns a normal result, execution continues. If it times out or fails, the failure is reflected in the structured result and surfaced to evaluation/approval/audit.
+
+Concrete failure example (deny-by-default):
+
+- A request asks for `mcp.unknown.example.tool` that does not exist in the catalog → tool selection/resolution does not resolve it.
+- A request asks for a tool from a disabled MCP server → the server's tools are not exposed.
+- A request asks for an allowed tool but the agent context lacks the corresponding MCP permission → registry execution returns denied.
+- A request asks for a tool from an unhealthy server → the lifecycle layer reports unhealthy; the adapter path treats an unconnected server as a clear failure.
 
 #### Phase 5 APIs
 - `GET /api/v1/workflows/{id}` - tenant-scoped workflow graph and task state
@@ -296,7 +346,7 @@ cd frontend && npm test
 pytest tests/test_workflow.py -v
 ```
 
-> **Note:** The default `pytest` run reports `382 passed, 23 skipped`. The 23
+> **Note:** The default `pytest` run reports `426 passed, 29 skipped`. The 23
 > skipped are real-infrastructure integration tests that only run with
 > `AEGISFORGE_INTEGRATION_TESTS=true` (23 passing when services are up). The
 > frontend suite adds 35 component/behavioral tests via `npm test`. Real-LLM
@@ -315,7 +365,8 @@ pytest tests/test_workflow.py -v
 | Legacy | `test_agent_workflow.py` | 3 | Updated legacy tests |
 | RAG | `test_rag.py` | 30 | Ingestion, chunking, embeddings, vector store, retrieval, RAG agent |
 | LLM Planner | `test_llm_planner.py` | 16 | LLM planner, validation, fallback |
-| MCP | `test_mcp.py` | 17 | MCP client, adapter, permissions, manager |
+| MCP | `test_mcp.py` | 19 | MCP client, adapter, permissions, manager |
+| MCP Lifecycle | `test_mcp_lifecycle.py` | 21 | lifecycle, health, timeout, failure, deny-by-default, allow-list, no-secrets |
 | Async | `test_async_execution.py` | 15 | Job queue, manager, worker, retry |
 | Approval | `test_approval.py` | 18 | Approval creation, decisions, expiry, safe actions |
 | Security | `test_security.py` | 22 | Document validation, tenant isolation, injection detection |
@@ -333,6 +384,7 @@ pytest tests/test_workflow.py -v
 | Rate Limit | `test_rate_limit.py` | 4 | Redis-backed rate limiting, configurable limits |
 | Security 4.2 | `test_security_phase42.py` | 5 | Tenant isolation, authorization, secrets recheck |
 | Integration | `tests/integration/` | 29 | Real PostgreSQL/pgvector + Redis (opt-in via env flag), including hybrid retrieval |
+| MCP Lifecycle | `tests/test_mcp_lifecycle.py` | 21 | MCP lifecycle, health, timeout, failure-mode, deny-by-default, allow-list, no-secrets |
 | Frontend | `frontend/src/**/*.test.*` | 35 | API client, auth, login, dashboard, approvals, documents, requests |
 
 ## Documentation

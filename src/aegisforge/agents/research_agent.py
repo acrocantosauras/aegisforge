@@ -40,7 +40,9 @@ class ResearchAgent(BaseAgent):
         )
         self._registry = registry or get_tool_registry()
 
-    def _execute(self, input_data: dict[str, Any], context: AgentExecutionContext) -> AgentResult:
+    def _execute(
+        self, input_data: dict[str, Any], context: AgentExecutionContext
+    ) -> AgentResult:
         query = input_data.get("query", "")
         if not query:
             return AgentResult(
@@ -69,7 +71,9 @@ class ResearchAgent(BaseAgent):
         granted = [p.name for p in context.permissions if p.allow]
 
         # Execute through the registry (permission check happens inside)
-        exec_result = self._registry.execute(tool_name, {"query": query}, granted)
+        exec_result = self._registry.execute(
+            tool_name, {"query": query}, granted, context=context
+        )
 
         # Record tool call
         tool_call = ToolCallRecord(

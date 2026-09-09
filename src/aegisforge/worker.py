@@ -227,6 +227,40 @@ def _create_job_handler(settings: Settings) -> Any:
                 "final_result": final_state.get("final_result", {}),
                 "errors": final_state.get("errors", []),
             }
+        except Exception as exc:
+            # Ensure the request always reaches a terminal state.
+            # Without this handler the request would remain stuck at
+            # "executing" whenever the workflow throws, because the
+            # try/finally above never updated the status on the error path.
+            logger.exception("Worker handler exception for job %s", job.job_id)
+            _org = job.organization_id or ""
+            _actor = getattr(request, "requested_by", "") if "request" in locals() else ""
+            try:
+                update_request_status(
+                    db, job.request_id, RequestStatus.FAILED
+                )
+                record_audit_event(
+                    db,
+                    organization_id=_org,
+                    actor_id=_actor,
+                    action="workflow.failed",
+                    resource_type="request",
+                    resource_id=job.request_id,
+                    outcome="failure",
+                    metadata={
+                        "error": str(exc),
+                        "workflow_id": job.workflow_id,
+                    },
+                    request_id=job.request_id,
+                )
+                _update_job_model(
+                    db, job, ExecutionJobStatus.FAILED.value, error=str(exc)
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist failure state for job %s", job.job_id
+                )
+            raise
         finally:
             db.close()
 

@@ -108,7 +108,12 @@ class BaseTool(ABC):
                 return False
         return True
 
-    def execute(self, input_data: dict[str, Any], granted_permissions: list[str] | None = None) -> ToolExecutionResult:
+    def execute(
+        self,
+        input_data: dict[str, Any],
+        granted_permissions: list[str] | None = None,
+        context: Any | None = None,
+    ) -> ToolExecutionResult:
         """Public entry point: permission check → validation → execution."""
         exec_id = str(uuid.uuid4())
 
@@ -125,7 +130,7 @@ class BaseTool(ABC):
         start = time.monotonic()
         try:
             with _track_tool(self.name):
-                output = self._execute(input_data)
+                output = self._execute(input_data, context=context)
             elapsed = int((time.monotonic() - start) * 1000)
             return ToolExecutionResult(
                 status=TStatus.COMPLETED,
@@ -154,6 +159,8 @@ class BaseTool(ABC):
             )
 
     @abstractmethod
-    def _execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    def _execute(
+        self, input_data: dict[str, Any], context: Any | None = None
+    ) -> dict[str, Any]:
         """Override in subclasses with actual tool logic."""
         ...

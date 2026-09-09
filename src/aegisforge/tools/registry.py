@@ -3,8 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from aegisforge.domain.models import ToolExecutionStatus
-from aegisforge.tools.base import BaseTool, ToolDefinition, ToolExecutionResult
+from aegisforge.tools.base import BaseTool, ToolDefinition, ToolExecutionResult, TStatus
 
 logger = logging.getLogger(__name__)
 
@@ -46,20 +45,32 @@ class ToolRegistry:
         tool_name: str,
         input_data: dict[str, Any],
         granted_permissions: list[str] | None = None,
+        context: Any | None = None,
     ) -> ToolExecutionResult:
         """Discover and execute a tool by name.
 
-        If *granted_permissions* is ``None``, permission checking is
-        skipped (used for internal / trusted execution paths).
+        Permission checks run before execution. If *granted_permissions* is
+        ``None``, permission checking is skipped (used for internal/trusted
+        execution paths only).
+
+        Deny-by-default: unknown tools, disabled tools, and tools whose
+        permission requirements are not satisfied must not execute.
         """
         tool = self._tools.get(tool_name)
         if tool is None:
             return ToolExecutionResult(
-                status=ToolExecutionStatus.FAILED,
+                status=TStatus.FAILED,
                 error=f"Tool '{tool_name}' not found in registry",
                 tool_name=tool_name,
             )
-        result = tool.execute(input_data, granted_permissions)
+        # Fail closed: disabled tools must not execute.
+        if not getattr(tool.definition, "enabled", True):
+            return ToolExecutionResult(
+                status=TStatus.DENIED,
+                error=f"Tool '{tool_name}' is disabled",
+                tool_name=tool_name,
+            )
+        result = tool.execute(input_data, granted_permissions, context=context)
         logger.info(
             "Tool execution: %s -> %s (%d ms)",
             tool_name,
@@ -67,6 +78,11 @@ class ToolRegistry:
             result.duration_ms,
         )
         return result
+
+    def update(self, tool: BaseTool) -> None:
+        """Register or replace a tool by name."""
+        self._tools[tool.name] = tool
+        logger.info("Updated tool: %s v%s", tool.name, tool.definition.version)
 
     def validate_permissions(self, tool_name: str, granted: list[str]) -> bool:
         """Check whether *granted* permissions satisfy the tool's requirements."""

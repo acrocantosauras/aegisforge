@@ -560,7 +560,8 @@ def route_after_multi_agent(state: dict[str, Any]) -> str:
 def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
     """Evaluate the agent result.
 
-    F8: Uses deterministic ResultEvaluator + optional LLM Critic.
+    Phase 5.3D/5.3G: Uses deterministic ResultEvaluator + optional LLM Critic,
+    with evidence-aware assessment and structured evaluation decisions.
     """
     agent_result_dict = state.get("agent_result", {})
 
@@ -581,13 +582,50 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
     evaluator = ResultEvaluator()
     evaluation = evaluator.evaluate(agent_result, expected_fields=["query", "answer"])
 
-    # F8: LLM critic (optional, when provider is configured)
+    # Phase 5.3C: Evidence-aware evaluation
+    evidence_assessment: dict[str, Any] = {}
+    try:
+        from aegisforge.evaluation.evidence import classify_evidence_quality
+        evidence_items = []
+        # Gather evidence from agent result
+        for item in (agent_result.result or {}).get("evidence", []):
+            if isinstance(item, dict):
+                evidence_items.append(item)
+        for item in agent_result.evidence:
+            if isinstance(item, dict):
+                evidence_items.append(item)
+        if evidence_items:
+            e_assessment = classify_evidence_quality(evidence_items, query=state.get("intent", ""))
+            evidence_assessment = e_assessment.to_dict()
+            # If evidence is insufficient, penalize the evaluation score
+            if not e_assessment.evidence_sufficient and evaluation.score > 0.3:
+                evaluation.score *= 0.85
+                evaluation.reasons.append("Evidence quality is insufficient for high confidence")
+    except Exception as exc:
+        logger.debug("Evidence assessment failed (non-fatal): %s", exc)
+
+    # Phase 5.3D: LLM critic (optional, when provider is configured)
+    critic_details: dict[str, Any] = {}
     if _ctx.critic is not None:
         try:
+            # Build evidence context for the critic
+            evidence_text = ""
+            for item in (agent_result.result or {}).get("citations", []):
+                if isinstance(item, dict):
+                    evidence_text += f"\n- {item.get('source', 'unknown')}: {str(item.get('snippet', ''))[:200]}"
+
             critic_result = _ctx.critic.evaluate_response(
                 query=state.get("intent", ""),
                 response_text=agent_result.result.get("answer", agent_result.summary),
+                evidence=evidence_text[:2000],
             )
+            critic_details = {
+                "critic_score": critic_result.score,
+                "critic_verdict": critic_result.verdict,
+                "critic_reasoning": critic_result.reasoning,
+                "critic_failures": critic_result.failures,
+                "deterministic_score": evaluation.score,
+            }
             if critic_result.verdict == "failed":
                 # LLM critic says the response is bad — override to RETRY if possible
                 evaluation = EvaluationResult(
@@ -596,9 +634,8 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
                     reasons=critic_result.failures or ["LLM critic flagged response quality"],
                     retryable=True,
                     details={
-                        "critic_score": critic_result.score,
-                        "critic_reasoning": critic_result.reasoning,
-                        "deterministic_score": evaluation.score,
+                        **critic_details,
+                        "evidence_assessment": evidence_assessment,
                     },
                 )
                 logger.info(
@@ -614,6 +651,13 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("LLM critic evaluation failed (non-fatal): %s", exc)
 
+    # Phase 5.3G: Attach intelligence observability metadata
+    if not evaluation.details:
+        evaluation.details = {}
+    evaluation.details["evidence_assessment"] = evidence_assessment
+    if critic_details:
+        evaluation.details["critic"] = critic_details
+
     result_state = _copy_state(
         state,
         evaluation=evaluation.model_dump(),
@@ -624,7 +668,11 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Decide whether to retry, check for approval, or move to the next task."""
+    """Decide whether to retry, check for approval, or move to the next task.
+
+    Phase 5.3E/5.3G: Adds structured recovery decisions and intelligence
+    observability (retry reasoning, failure analysis).
+    """
     eval_dict = state.get("evaluation", {})
     evaluation = EvaluationResult(**eval_dict)
     retry_count = state.get("retry_count", 0)
@@ -650,6 +698,14 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
             evaluation_loop_count=eval_loop_count,
         )
 
+    # Phase 5.3G: Intelligence decision log
+    recovery_decision: dict[str, Any] = {
+        "eval_loop_count": eval_loop_count,
+        "verdict": evaluation.verdict.value if hasattr(evaluation.verdict, 'value') else str(evaluation.verdict),
+        "score": evaluation.score,
+        "retry_count": retry_count,
+    }
+
     if evaluation.verdict == EvaluationVerdict.PASSED:
         # Check if this task requires approval before moving on
         task = state.get("current_task", {})
@@ -671,6 +727,8 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
                         reason=task.get("description", ""),
                     )
                     approval_id = approval.approval_id
+                    recovery_decision["action"] = "approval_required"
+                    recovery_decision["approval_id"] = approval_id
                     logger.info(
                         "Workflow %s paused: created approval %s (risk=%s)",
                         state.get("workflow_id", ""),
@@ -688,6 +746,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
                 approval_action=task.get("action_description", "Task execution"),
                 approval_id=approval_id,
                 evaluation_loop_count=eval_loop_count,
+                recovery_decision=recovery_decision,
             )
             _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
             return result_state
@@ -695,27 +754,35 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
         # Move to next task or complete
         next_index = task_index + 1
         if next_index >= len(tasks):
+            recovery_decision["action"] = "workflow_completed"
             result_state = _copy_state(
                 state,
                 status=RequestStatus.COMPLETED.value,
                 final_result=state.get("agent_result", {}),
                 current_task_index=next_index,
                 evaluation_loop_count=eval_loop_count,
+                recovery_decision=recovery_decision,
             )
             _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
             return result_state
+        recovery_decision["action"] = "advance_to_next_task"
+        recovery_decision["next_task_index"] = next_index
         result_state = _copy_state(
             state,
             current_task_index=next_index,
             status=RequestStatus.EXECUTING.value,
             retry_count=0,
             evaluation_loop_count=eval_loop_count,
+            recovery_decision=recovery_decision,
         )
         _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
         return result_state
 
     if evaluation.verdict == EvaluationVerdict.RETRY and retry_count < max_retries:
         record_workflow_retry()
+        recovery_decision["action"] = "retry"
+        recovery_decision["reasons"] = evaluation.reasons
+        recovery_decision["next_attempt"] = retry_count + 1
         logger.info(
             "Retrying task (attempt %d/%d): %s",
             retry_count + 1,
@@ -727,11 +794,14 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
             retry_count=retry_count + 1,
             status=RequestStatus.RETRYING.value,
             evaluation_loop_count=eval_loop_count,
+            recovery_decision=recovery_decision,
         )
         _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
         return result_state
 
     # Terminal failure
+    recovery_decision["action"] = "terminal_failure"
+    recovery_decision["reasons"] = evaluation.reasons
     result_state = _copy_state(
         state,
         status=RequestStatus.FAILED.value,
@@ -739,6 +809,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
             f"Evaluation failed: {'; '.join(evaluation.reasons)}"
         ],
         evaluation_loop_count=eval_loop_count,
+        recovery_decision=recovery_decision,
     )
     _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
     return result_state

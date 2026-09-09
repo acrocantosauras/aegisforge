@@ -43,7 +43,9 @@ class MCPToolAdapter(BaseTool):
         self._server_config = server_config
         self._mcp_tool_name = mcp_tool.name
 
-    def _execute(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    def _execute(
+        self, input_data: dict[str, Any], context: Any | None = None
+    ) -> dict[str, Any]:
         # Verify connection
         if not self._mcp_client.is_connected(self._server_config.server_id):
             raise RuntimeError(

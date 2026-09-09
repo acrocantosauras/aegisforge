@@ -729,6 +729,77 @@ class MultiAgentExecutor:
             pool.shutdown(wait=False, cancel_futures=True)
         return concurrency
 
+    def _classify_failure(self, errors: list[str], status: Any) -> str:
+        """Classify a failure type for recovery decisions (Phase 5.3E).
+
+        Returns one of: "transient", "configuration", "dependency",
+        "permission", "timeout", "unknown".
+        """
+        error_text = ";".join(errors).lower() if errors else ""
+        status_val = status.value if hasattr(status, "value") else str(status)
+
+        if status_val == "timeout":
+            return "timeout"
+        if status_val == "denied":
+            return "permission"
+        if any(kw in error_text for kw in ["not connected", "unavailable", "refused", "connection"]):
+            return "transient"
+        if any(kw in error_text for kw in ["not configured", "not available", "not registered", "not found"]):
+            return "configuration"
+        if any(kw in error_text for kw in ["dependency", "required dependency", "blocked"]):
+            return "dependency"
+        return "unknown"
+
+    def _suggest_recovery(self, failure_type: str, retry_count: int, max_retries: int) -> dict[str, Any]:
+        """Suggest a recovery strategy based on failure classification (Phase 5.3E).
+
+        Returns a structured decision: action + reason.
+        """
+        remaining = max_retries - retry_count
+
+        if failure_type == "transient" and remaining > 0:
+            return {
+                "action": "retry",
+                "reason": f"Transient failure with {remaining} retries remaining",
+                "recoverable": True,
+            }
+        if failure_type == "timeout" and remaining > 0:
+            return {
+                "action": "retry_with_extended_timeout",
+                "reason": f"Timeout with {remaining} retries remaining",
+                "recoverable": True,
+            }
+        if failure_type == "configuration":
+            return {
+                "action": "skip",
+                "reason": "Configuration error — tool/agent not available",
+                "recoverable": False,
+            }
+        if failure_type == "permission":
+            return {
+                "action": "escalate",
+                "reason": "Permission denied — requires policy review",
+                "recoverable": False,
+            }
+        if failure_type == "dependency":
+            return {
+                "action": "skip",
+                "reason": "Required dependency failed",
+                "recoverable": False,
+            }
+        # Unknown or exhausted retries
+        if remaining > 0:
+            return {
+                "action": "retry",
+                "reason": f"Unknown failure with {remaining} retries remaining",
+                "recoverable": True,
+            }
+        return {
+            "action": "abort",
+            "reason": "All retries exhausted",
+            "recoverable": False,
+        }
+
     def _run_task_with_retries(
         self,
         task: ExecutionPlanTask,
@@ -741,12 +812,17 @@ class MultiAgentExecutor:
         user_id: str,
         intent: str,
     ) -> None:
-        """Run one task with its own retry/timeout handling (worker thread)."""
+        """Run one task with its own retry/timeout handling (worker thread).
+
+        Phase 5.3E: Adds structured failure classification and recovery
+        decision logging for observability.
+        """
         record = records[task.task_id]
         started = time.monotonic()
         record.started_at = started
         record.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
         attempts = task.max_retries + 1
+        recovery_log: list[dict[str, Any]] = []
 
         for attempt in range(attempts):
             if attempt > 0:
@@ -800,11 +876,31 @@ class MultiAgentExecutor:
             # Failed / denied / timeout → record and retry if attempts remain.
             record.status = result.status
             record.errors = list(result.errors or [f"Agent finished with status {result.status.value}"])
+
+            # Phase 5.3E: Classify failure and log recovery decision
+            failure_type = self._classify_failure(record.errors, result.status)
+            recovery = self._suggest_recovery(failure_type, attempt, task.max_retries)
+            recovery_log.append({
+                "attempt": attempt + 1,
+                "failure_type": failure_type,
+                "recovery_action": recovery["action"],
+                "recoverable": recovery["recoverable"],
+                "reason": recovery["reason"],
+            })
+            logger.info(
+                "Task %s attempt %d/%d: failure_type=%s, recovery=%s",
+                task.task_id, attempt + 1, attempts,
+                failure_type, recovery["action"],
+            )
+
             if attempt < attempts - 1:
                 record.status = AgentExecutionStatus.PENDING  # allow retry loop
                 continue
         record.completed_at = time.monotonic()
         record.duration_ms = int((time.monotonic() - started) * 1000)
+        # Attach recovery log to record metadata for observability
+        if recovery_log:
+            record.output["_recovery_log"] = recovery_log
         self._record_metrics(task, record)
 
     @staticmethod

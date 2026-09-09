@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import queue
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -16,6 +19,8 @@ from typing import Any
 from aegisforge.domain.models import MCPServerConfig, MCPToolDefinition
 
 logger = logging.getLogger(__name__)
+
+_MCP_STDIO_DEBUG = os.environ.get("AEGISFORGE_MCP_STDIO_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 
 
 @dataclass
@@ -131,6 +136,62 @@ class MockMCPClient(MCPClient):
         self._tool_responses[f"{server_id}:{tool_name}"] = response
 
 
+class _StdioStream:
+    """Threaded reader for a single MCP server's stdout.
+
+    A separate thread drains stdout into a per-request response queue so the
+    caller never blocks the write side waiting on reads.  Each request gets
+    its own response queue and a bounded wall-clock deadline.
+    """
+
+    def __init__(self, process: Any) -> None:
+        self._process = process
+        self._stdout = process.stdout
+        self._pending: dict[str, queue.Queue[dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+        self._worker = threading.Thread(target=self._run, daemon=True, name="mcp-stdio-reader")
+        self._worker.start()
+
+    def request(self, request_id: str, timeout_seconds: float) -> dict[str, Any] | None:
+        with self._lock:
+            q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+            self._pending[request_id] = q
+        try:
+            return q.get(timeout=timeout_seconds)
+        except queue.Empty:
+            return None
+        finally:
+            with self._lock:
+                self._pending.pop(request_id, None)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                line = self._stdout.readline()
+                if not line:
+                    break
+                try:
+                    parsed = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    logger.debug("MCP stdio: skipping non-JSON line: %s", line.rstrip())
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                req_id = parsed.get("id")
+                if not req_id:
+                    continue
+                with self._lock:
+                    pending = self._pending.get(req_id)
+                if pending is not None:
+                    try:
+                        pending.put_nowait(parsed)
+                    except queue.Full:
+                        pass
+        except Exception as exc:
+            if _MCP_STDIO_DEBUG:
+                logger.debug("MCP stdout reader stopped: %s", exc)
+
+
 class StdioMCPClient(MCPClient):
     """MCP client using stdio transport.
 
@@ -140,6 +201,7 @@ class StdioMCPClient(MCPClient):
     def __init__(self) -> None:
         self._processes: dict[str, Any] = {}
         self._connected: dict[str, bool] = {}
+        self._streams: dict[str, _StdioStream] = {}
 
     def connect(self, server_config: MCPServerConfig) -> bool:
         if not server_config.command:
@@ -158,6 +220,7 @@ class StdioMCPClient(MCPClient):
             )
             self._processes[server_config.server_id] = process
             self._connected[server_config.server_id] = True
+            self._streams[server_config.server_id] = _StdioStream(process)
             logger.info("Connected to MCP server: %s", server_config.server_id)
             return True
         except Exception:
@@ -165,6 +228,7 @@ class StdioMCPClient(MCPClient):
             return False
 
     def disconnect(self, server_id: str) -> None:
+        self._streams.pop(server_id, None)
         process = self._processes.pop(server_id, None)
         if process:
             try:
@@ -175,19 +239,23 @@ class StdioMCPClient(MCPClient):
         self._connected.pop(server_id, None)
 
     def discover_tools(self, server_id: str) -> list[MCPToolDefinition]:
-        # Send tools/list request via JSON-RPC
-        response = self._send_request(server_id, "tools/list", {})
-        if response and "tools" in response:
-            return [
-                MCPToolDefinition(
-                    name=tool.get("name", ""),
-                    description=tool.get("description", ""),
-                    server_id=server_id,
-                    input_schema=tool.get("inputSchema", {}),
-                )
-                for tool in response["tools"]
-            ]
-        return []
+        response = self._rpc(server_id, "tools/list", {}, timeout_seconds=5)
+        if not response:
+            return []
+        # JSON-RPC nests the payload under ``result``: {"jsonrpc": ..., "id": ..., "result": {"tools": [...]}}
+        payload = response.get("result")
+        tools_payload = payload.get("tools") if isinstance(payload, dict) else None
+        if not tools_payload:
+            return []
+        return [
+            MCPToolDefinition(
+                name=tool.get("name", ""),
+                description=tool.get("description", ""),
+                server_id=server_id,
+                input_schema=tool.get("inputSchema", {}),
+            )
+            for tool in tools_payload
+        ]
 
     def invoke_tool(
         self,
@@ -198,11 +266,11 @@ class StdioMCPClient(MCPClient):
     ) -> MCPToolResult:
         start = time.monotonic()
         try:
-            response = self._send_request(
+            response = self._rpc(
                 server_id,
                 "tools/call",
                 {"name": tool_name, "arguments": arguments},
-                timeout=timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
             elapsed = int((time.monotonic() - start) * 1000)
 
@@ -263,38 +331,35 @@ class StdioMCPClient(MCPClient):
         process = self._processes.get(server_id)
         return self._connected.get(server_id, False) and process is not None and process.poll() is None
 
-    def _send_request(
+    def _rpc(
         self,
         server_id: str,
         method: str,
         params: dict[str, Any],
-        timeout: int = 30,
+        timeout_seconds: float = 30,
     ) -> dict[str, Any] | None:
         process = self._processes.get(server_id)
-        if process is None or process.poll() is not None:
+        stream = self._streams.get(server_id)
+        if process is None or stream is None or process.poll() is not None:
             return None
 
+        request_id = str(uuid.uuid4())
         request = {
             "jsonrpc": "2.0",
-            "id": str(uuid.uuid4()),
+            "id": request_id,
             "method": method,
             "params": params,
         }
 
         try:
             assert process.stdin is not None
-            assert process.stdout is not None
-            process.stdin.write(json.dumps(request) + "\n")
+            payload = json.dumps(request) + "\n"
+            if _MCP_STDIO_DEBUG:
+                logger.debug("MCP> %s[%s]: %s", server_id, request_id, payload.strip())
+            process.stdin.write(payload)
             process.stdin.flush()
 
-            import select
-
-            ready, _, _ = select.select([process.stdout], [], [], timeout)
-            if not ready:
-                return None
-
-            line = process.stdout.readline()
-            return json.loads(line) if line else None
+            return stream.request(request_id, timeout_seconds=timeout_seconds)
         except Exception:
             logger.exception("MCP communication error with %s", server_id)
             return None

@@ -25,7 +25,9 @@ class DummyTool(BaseTool):
     def __init__(self, **overrides):
         super().__init__(_make_tool_def(**overrides))
 
-    def _execute(self, input_data: dict) -> dict:
+    def _execute(
+        self, input_data: dict[str, object], context: object | None = None
+    ) -> dict[str, object]:
         return {"result": "ok", "input": input_data}
 
 
@@ -33,7 +35,9 @@ class FailingTool(BaseTool):
     def __init__(self):
         super().__init__(_make_tool_def(name="failing.tool"))
 
-    def _execute(self, input_data: dict) -> dict:
+    def _execute(
+        self, input_data: dict[str, object], context: object | None = None
+    ) -> dict[str, object]:
         raise RuntimeError("Tool intentionally failed")
 
 
