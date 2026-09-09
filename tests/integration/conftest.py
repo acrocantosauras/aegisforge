@@ -55,11 +55,26 @@ def redis_client():
         socket_timeout=2.0,
     )
     client.ping()
-    # Start clean: stale jobs from a previous run must not interfere.
-    client.delete("aegisforge:jobs")
+    # Start clean: stale keys from previous runs must not interfere.
+    for pattern in [
+        "aegisforge:jobs",
+        "aegisforge:job:*",
+        "aegisforge:idempotency:*",
+        "aegisforge:active_claims",
+        "aegisforge:workers",
+        "ratelimit:*",
+    ]:
+        for key in client.keys(pattern):
+            client.delete(key)
     yield client
     # Clean up test keys
-    for key in client.keys("aegisforge:jobs"):
-        client.delete(key)
-    for key in client.keys("ratelimit:*"):
-        client.delete(key)
+    for pattern in [
+        "aegisforge:jobs",
+        "aegisforge:job:*",
+        "aegisforge:idempotency:*",
+        "aegisforge:active_claims",
+        "aegisforge:workers",
+        "ratelimit:*",
+    ]:
+        for key in client.keys(pattern):
+            client.delete(key)

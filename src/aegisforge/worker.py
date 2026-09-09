@@ -2,13 +2,21 @@
 
 Runs as a separate process, consuming jobs from Redis and executing workflows.
 Supports graceful shutdown and health checks.
+
+Phase 6B: Distributed-safe multi-worker execution with:
+- Worker identity for tracking
+- Heartbeat refresh during job execution
+- Crash recovery scanning
+- Graceful shutdown with claim cleanup
 """
 from __future__ import annotations
 
 import logging
 import signal
 import sys
+import threading
 import time
+import uuid
 from typing import Any
 
 from aegisforge.async_execution.jobs import (
@@ -19,11 +27,16 @@ from aegisforge.async_execution.jobs import (
 )
 from aegisforge.config import Settings, get_model_provider_from_settings, get_settings
 from aegisforge.db.session import get_session_factory
+from aegisforge.observability.metrics import set_active_workers
 
 logger = logging.getLogger(__name__)
 
 # Graceful shutdown flag
 _shutdown_requested = False
+
+# Heartbeat interval for worker registry
+_WORKER_HEARTBEAT_INTERVAL = 30  # seconds
+_RECOVERY_SCAN_INTERVAL = 60  # seconds
 
 
 def _handle_signal(signum: int, frame: Any) -> None:
@@ -229,9 +242,6 @@ def _create_job_handler(settings: Settings) -> Any:
             }
         except Exception as exc:
             # Ensure the request always reaches a terminal state.
-            # Without this handler the request would remain stuck at
-            # "executing" whenever the workflow throws, because the
-            # try/finally above never updated the status on the error path.
             logger.exception("Worker handler exception for job %s", job.job_id)
             _org = job.organization_id or ""
             _actor = getattr(request, "requested_by", "") if "request" in locals() else ""
@@ -268,12 +278,7 @@ def _create_job_handler(settings: Settings) -> Any:
 
 
 def _create_retrieval_service(settings: Settings) -> Any:
-    """Create a RetrievalService if embedding provider is configured.
-
-    In production, PostgreSQL/pgvector is REQUIRED when a PostgreSQL
-    database is configured — failure is raised, not silently swallowed,
-    so the worker fails clearly instead of degrading to in-memory.
-    """
+    """Create a RetrievalService if embedding provider is configured."""
     is_production = settings.environment not in ("development", "test", "")
     try:
         from aegisforge.rag.embeddings import get_embedding_provider
@@ -326,19 +331,24 @@ def _create_retrieval_service(settings: Settings) -> Any:
 
 
 def run_worker(settings: Settings | None = None) -> None:
-    """Main worker loop."""
+    """Main worker loop.
+
+    Phase 6B: Multi-worker safe with heartbeat, recovery scanning, and
+    worker registry.
+    """
     settings = settings or get_settings()
+    worker_id = f"worker-{uuid.uuid4().hex[:8]}"
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
     # Register signal handlers
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    logger.info("Starting AegisForge worker...")
+    logger.info("Starting AegisForge worker [%s]...", worker_id)
     logger.info("Redis URL: %s", settings.redis_url)
 
     # F7: Create queue — fail clearly if Redis is unavailable in production
@@ -373,16 +383,65 @@ def run_worker(settings: Settings | None = None) -> None:
     # Create job manager and worker
     job_manager = JobManager(queue)
     handler = _create_job_handler(settings)
-    worker = JobWorker(job_manager, handler)
+    job_worker = JobWorker(job_manager, handler, worker_id=worker_id)
 
-    logger.info("Worker ready, polling for jobs...")
+    # Phase 6B: Register worker in Redis registry
+    job_worker.register_in_registry()
+    logger.info("Worker [%s] registered in worker registry", worker_id)
+
+    # Phase 6B: Start heartbeat thread
+    def _heartbeat_loop() -> None:
+        while not _shutdown_requested:
+            try:
+                # Refresh job heartbeat if processing
+                job_worker.send_heartbeat()
+                # Refresh worker registry heartbeat
+                job_worker.refresh_registry()
+                # Update active workers metric
+                if isinstance(queue, RedisJobQueue):
+                    active = queue.get_active_workers()
+                    set_active_workers(len(active))
+            except Exception:  # noqa: S110 — observability must never break execution
+                pass
+            time.sleep(_WORKER_HEARTBEAT_INTERVAL)
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop, daemon=True, name=f"heartbeat-{worker_id}"
+    )
+    heartbeat_thread.start()
+
+    # Phase 6B: Start recovery scan thread
+    def _recovery_loop() -> None:
+        while not _shutdown_requested:
+            try:
+                time.sleep(_RECOVERY_SCAN_INTERVAL)
+                if _shutdown_requested:
+                    break
+                recovered = job_worker.recover_expired_jobs()
+                if recovered:
+                    logger.info(
+                        "Worker [%s] recovered %d expired job(s): %s",
+                        worker_id, len(recovered), recovered,
+                    )
+            except Exception:  # noqa: S110 — observability must never break execution
+                pass
+
+    recovery_thread = threading.Thread(
+        target=_recovery_loop, daemon=True, name=f"recovery-{worker_id}"
+    )
+    recovery_thread.start()
+
+    logger.info("Worker [%s] ready, polling for jobs...", worker_id)
 
     poll_interval = 1.0
     while not _shutdown_requested:
         try:
-            job = worker.process_next_job()
+            job = job_worker.process_next_job()
             if job is not None:
-                logger.info("Processed job %s: %s", job.job_id, job.status.value)
+                logger.info(
+                    "Worker [%s] processed job %s: %s",
+                    worker_id, job.job_id, job.status.value,
+                )
                 poll_interval = 1.0
             else:
                 time.sleep(poll_interval)
@@ -391,7 +450,9 @@ def run_worker(settings: Settings | None = None) -> None:
             logger.exception("Worker error")
             time.sleep(5.0)
 
-    logger.info("Worker shutdown complete")
+    # Phase 6B: Graceful shutdown — unregister from registry
+    job_worker.unregister_from_registry()
+    logger.info("Worker [%s] shutdown complete", worker_id)
 
 
 if __name__ == "__main__":

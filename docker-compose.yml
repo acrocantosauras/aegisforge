@@ -16,6 +16,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -29,6 +30,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   api:
     build:
@@ -36,31 +38,30 @@ services:
       dockerfile: Dockerfile
     command: >
       sh -c "alembic upgrade head &&
-             uvicorn aegisforge.app:app --host 0.0.0.0 --port 8000 --reload"
+             uvicorn aegisforge.app:app --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@postgres:5432/aegisforge
       REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: dev-secret-key-change-in-production
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       LLM_PROVIDER: deterministic
       EMBEDDING_PROVIDER: deterministic
       EMBEDDING_DIMENSION: "384"
       ENVIRONMENT: development
-    volumes:
-      - .:/app
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/v1/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 15s
       timeout: 5s
       retries: 3
+    restart: unless-stopped
 
-  worker:
+  worker-1:
     build:
       context: .
       dockerfile: Dockerfile
@@ -68,18 +69,46 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@postgres:5432/aegisforge
       REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: dev-secret-key-change-in-production
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       LLM_PROVIDER: deterministic
       EMBEDDING_PROVIDER: deterministic
       EMBEDDING_DIMENSION: "384"
       ENVIRONMENT: development
-    volumes:
-      - .:/app
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.from_url('redis://redis:6379/0'); r.ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m aegisforge.worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@postgres:5432/aegisforge
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      LLM_PROVIDER: deterministic
+      EMBEDDING_PROVIDER: deterministic
+      EMBEDDING_DIMENSION: "384"
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.from_url('redis://redis:6379/0'); r.ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
   frontend:
@@ -116,6 +145,8 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus_data:/prometheus
+    depends_on:
+      - otel-collector
     profiles:
       - observability
 
@@ -124,8 +155,8 @@ services:
     ports:
       - "3001:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
     volumes:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
       - ./observability/grafana/provisioning:/etc/grafana/provisioning

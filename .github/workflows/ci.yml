@@ -94,6 +94,21 @@ jobs:
           DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@localhost:5432/aegisforge
         run: alembic upgrade head
 
+      - name: Verify pgvector extension
+        env:
+          DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@localhost:5432/aegisforge
+        run: |
+          python -c "
+          from sqlalchemy import text
+          from aegisforge.db.session import get_engine
+          engine = get_engine()
+          with engine.connect() as conn:
+              result = conn.execute(text(\"SELECT extname FROM pg_extension WHERE extname = 'vector'\"))
+              row = result.fetchone()
+              assert row is not None, 'pgvector extension not installed'
+              print('pgvector extension: OK')
+          "
+
       - name: PostgreSQL + pgvector integration tests
         env:
           AEGISFORGE_INTEGRATION_TESTS: "true"
@@ -133,3 +148,128 @@ jobs:
           AEGISFORGE_INTEGRATION_TESTS: "true"
           AEGISFORGE_TEST_REDIS_URL: redis://localhost:6379/0
         run: pytest -q tests/integration/test_redis_integration.py
+
+  integration-distributed:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Distributed worker concurrency tests
+        run: |
+          pytest -v tests/test_distributed_worker.py 2>&1 | tee /tmp/dist-results.txt
+          # Fail if any test was skipped (Redis should be available from service container)
+          SKIPPED=$(grep -c 'SKIPPED' /tmp/dist-results.txt || true)
+          PASSED=$(grep -c 'PASSED' /tmp/dist-results.txt || true)
+          echo "Passed: $PASSED, Skipped: $SKIPPED"
+          if [ "$SKIPPED" -gt 0 ]; then
+            echo "ERROR: $SKIPPED test(s) were skipped — Redis should be available"
+            exit 1
+          fi
+          if [ "$PASSED" -eq 0 ]; then
+            echo "ERROR: No tests passed"
+            exit 1
+          fi
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t aegisforge:test .
+
+      - name: Verify container starts and responds to health check
+        run: |
+          docker run -d --name aegisforge-test \
+            -e DATABASE_URL=sqlite:///./aegisforge.db \
+            -e REDIS_URL=redis://localhost:6379/0 \
+            -e LLM_PROVIDER=deterministic \
+            -e EMBEDDING_PROVIDER=deterministic \
+            -e EMBEDDING_DIMENSION=384 \
+            -e ENVIRONMENT=development \
+            -p 8001:8000 \
+            aegisforge:test
+          sleep 5
+          curl -sf http://localhost:8001/api/v1/health || (docker logs aegisforge-test && exit 1)
+          docker stop aegisforge-test
+          docker rm aegisforge-test
+
+  fresh-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: aegisforge
+          POSTGRES_PASSWORD: aegisforge
+          POSTGRES_DB: aegisforge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aegisforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Verify fresh migration from empty database
+        env:
+          DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@localhost:5432/aegisforge
+        run: |
+          echo "=== Tables before migration ==="
+          python -c "
+          from sqlalchemy import text
+          from aegisforge.db.session import get_engine
+          engine = get_engine()
+          with engine.connect() as conn:
+              result = conn.execute(text(\"SELECT count(*) FROM information_schema.tables WHERE table_schema='public'\"))
+              print(f'Tables before: {result.scalar()}')
+          "
+          alembic upgrade head
+          echo "=== Tables after migration ==="
+          python -c "
+          from sqlalchemy import text
+          from aegisforge.db.session import get_engine
+          engine = get_engine()
+          with engine.connect() as conn:
+              result = conn.execute(text(\"SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename\"))
+              for row in result:
+                  print(f'  - {row[0]}')
+              count = conn.execute(text(\"SELECT count(*) FROM pg_tables WHERE schemaname='public'\")).scalar()
+              print(f'Total tables: {count}')
+          assert count >= 5, f'Expected at least 5 tables, got {count}'
+          "

@@ -194,6 +194,21 @@ try:
         buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0],
     )
 
+    # Phase 6B — Distributed worker metrics
+    WORKER_EVENTS_TOTAL = Counter(
+        "worker_events_total",
+        "Worker lifecycle events (claimed, completed, failed, retried)",
+        ["status"],
+    )
+    ACTIVE_WORKERS = Gauge(
+        "active_workers",
+        "Number of active workers with recent heartbeats",
+    )
+    JOBS_RECOVERED_TOTAL = Counter(
+        "jobs_recovered_total",
+        "Total jobs recovered from crashed workers",
+    )
+
     HAS_PROMETHEUS = True
 
 except ImportError:
@@ -431,3 +446,27 @@ def set_queue_depth(depth: int) -> None:
     if not HAS_PROMETHEUS:
         return
     QUEUE_DEPTH.set(depth)
+
+
+def record_worker_event(status: str) -> None:
+    """Record a distributed worker lifecycle event.
+
+    status: one of claimed, completed, failed, retried
+    """
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_EVENTS_TOTAL.labels(status=status).inc()
+
+
+def set_active_workers(count: int) -> None:
+    """Update the active workers gauge."""
+    if not HAS_PROMETHEUS:
+        return
+    ACTIVE_WORKERS.set(count)
+
+
+def record_job_recovered() -> None:
+    """Record a job recovery event."""
+    if not HAS_PROMETHEUS:
+        return
+    JOBS_RECOVERED_TOTAL.inc()
