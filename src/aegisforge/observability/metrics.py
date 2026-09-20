@@ -209,6 +209,65 @@ try:
         "Total jobs recovered from crashed workers",
     )
 
+    # Phase 6C — Enhanced queue observability
+    QUEUE_JOBS_DEQUEUED_TOTAL = Counter(
+        "queue_jobs_dequeued_total",
+        "Total jobs dequeued from the queue",
+    )
+    QUEUE_JOBS_CLAIMED_TOTAL = Counter(
+        "queue_jobs_claimed_total",
+        "Total jobs successfully claimed by workers",
+    )
+    QUEUE_JOBS_ABANDONED_TOTAL = Counter(
+        "queue_jobs_abandoned_total",
+        "Total jobs that reached terminal failure (max retries exhausted)",
+    )
+    QUEUE_WAIT_TIME = Histogram(
+        "queue_wait_time_seconds",
+        "Time a job spends waiting in the queue before being dequeued",
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+    )
+    WORKER_REGISTRATIONS_TOTAL = Counter(
+        "worker_registrations_total",
+        "Total worker registrations",
+    )
+    WORKER_DEREGISTRATIONS_TOTAL = Counter(
+        "worker_deregistrations_total",
+        "Total worker deregistrations",
+    )
+    WORKER_HEARTBEAT_FAILURES_TOTAL = Counter(
+        "worker_heartbeat_failures_total",
+        "Total worker heartbeat failures",
+    )
+    ACTIVE_CLAIMS = Gauge(
+        "active_claims",
+        "Number of currently active (unexpired) claims",
+    )
+    CLAIM_EXPIRATIONS_TOTAL = Counter(
+        "claim_expirations_total",
+        "Total claims that expired (worker may have crashed)",
+    )
+    CLAIM_EXTENSIONS_TOTAL = Counter(
+        "claim_extensions_total",
+        "Total visibility-timeout extensions via heartbeat",
+    )
+
+    # Phase 6C — Stuck job detection
+    STUCK_JOBS_DETECTED_TOTAL = Counter(
+        "stuck_jobs_detected_total",
+        "Total jobs detected as stuck by the watchdog",
+    )
+    STUCK_JOBS_RECOVERED_TOTAL = Counter(
+        "stuck_jobs_recovered_total",
+        "Total stuck jobs that were recovered",
+    )
+
+    # Phase 6D — Durable workflow resume
+    WORKFLOW_CHECKPOINT_RESUMES_TOTAL = Counter(
+        "workflow_checkpoint_resumes_total",
+        "Total workflows resumed from durable checkpoints after failure",
+    )
+
     HAS_PROMETHEUS = True
 
 except ImportError:
@@ -470,3 +529,105 @@ def record_job_recovered() -> None:
     if not HAS_PROMETHEUS:
         return
     JOBS_RECOVERED_TOTAL.inc()
+
+
+# --- Phase 6C: Enhanced queue/worker observability ---
+
+
+def record_job_dequeued() -> None:
+    """Record that a job was dequeued from the queue."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_DEQUEUED_TOTAL.inc()
+
+
+def record_job_claimed() -> None:
+    """Record that a job was successfully claimed by a worker."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_CLAIMED_TOTAL.inc()
+
+
+def record_job_abandoned() -> None:
+    """Record that a job reached terminal failure (abandoned)."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_ABANDONED_TOTAL.inc()
+
+
+def record_queue_wait_time(seconds: float) -> None:
+    """Record how long a job waited in the queue before being processed."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_WAIT_TIME.observe(max(seconds, 0.0))
+
+
+def record_worker_registration() -> None:
+    """Record a worker registration event."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_REGISTRATIONS_TOTAL.inc()
+
+
+def record_worker_deregistration() -> None:
+    """Record a worker deregistration event."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_DEREGISTRATIONS_TOTAL.inc()
+
+
+def record_worker_heartbeat_failure() -> None:
+    """Record a worker heartbeat failure."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_HEARTBEAT_FAILURES_TOTAL.inc()
+
+
+def set_active_claims(count: int) -> None:
+    """Update the active claims gauge."""
+    if not HAS_PROMETHEUS:
+        return
+    ACTIVE_CLAIMS.set(count)
+
+
+def record_claim_expiration() -> None:
+    """Record that a claim expired (possible worker crash)."""
+    if not HAS_PROMETHEUS:
+        return
+    CLAIM_EXPIRATIONS_TOTAL.inc()
+
+
+def record_claim_extension() -> None:
+    """Record a visibility-timeout extension via heartbeat."""
+    if not HAS_PROMETHEUS:
+        return
+    CLAIM_EXTENSIONS_TOTAL.inc()
+
+
+def record_stuck_job_detected() -> None:
+    """Record that the stuck-job detector found a stuck job."""
+    if not HAS_PROMETHEUS:
+        return
+    STUCK_JOBS_DETECTED_TOTAL.inc()
+
+
+def record_stuck_job_recovered() -> None:
+    """Record that a stuck job was recovered."""
+    if not HAS_PROMETHEUS:
+        return
+    STUCK_JOBS_RECOVERED_TOTAL.inc()
+
+
+# --- Phase 6D: Durable workflow resume ---
+
+
+def record_workflow_checkpoint_resume() -> None:
+    """Record that a workflow was resumed from a durable checkpoint.
+
+    This happens when a job is re-enqueued after a worker crash or
+    stuck-job recovery, and the workflow continues from the last
+    completed node instead of restarting from scratch.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    WORKFLOW_CHECKPOINT_RESUMES_TOTAL.inc()

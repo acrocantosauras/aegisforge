@@ -1,0 +1,175 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "title": "AegisForge Queue",
+  "uid": "aegisforge-queue",
+  "panels": [
+    {
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "queue_depth",
+          "legendFormat": "depth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "title": "Jobs Submitted",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(queue_jobs_total{status=\"queued\"}[5m])",
+          "legendFormat": "submitted/s"
+        }
+      ]
+    },
+    {
+      "title": "Queue Wait Time (p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(queue_wait_time_seconds_bucket[5m]))",
+          "legendFormat": "p95 wait"
+        },
+        {
+          "expr": "histogram_quantile(0.50, rate(queue_wait_time_seconds_bucket[5m]))",
+          "legendFormat": "p50 wait"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "Job Lifecycle",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(queue_jobs_total{status=\"completed\"}[5m])",
+          "legendFormat": "completed/s"
+        },
+        {
+          "expr": "rate(queue_jobs_total{status=\"failed\"}[5m])",
+          "legendFormat": "failed/s"
+        },
+        {
+          "expr": "rate(queue_jobs_total{status=\"retried\"}[5m])",
+          "legendFormat": "retried/s"
+        }
+      ]
+    },
+    {
+      "title": "Job Execution Duration (p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(job_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95 duration"
+        },
+        {
+          "expr": "rate(job_duration_seconds_sum[5m]) / rate(job_duration_seconds_count[5m])",
+          "legendFormat": "avg duration"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "Retries & Recoveries",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "rate(jobs_recovered_total[5m])",
+          "legendFormat": "recovered/s"
+        },
+        {
+          "expr": "rate(queue_jobs_total{status=\"retried\"}[5m])",
+          "legendFormat": "retried/s"
+        },
+        {
+          "expr": "rate(queue_jobs_abandoned_total[5m])",
+          "legendFormat": "abandoned/s"
+        }
+      ]
+    },
+    {
+      "title": "Active Claims",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "active_claims",
+          "legendFormat": "active claims"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "title": "Claim Expirations",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "targets": [
+        {
+          "expr": "rate(claim_expirations_total[5m])",
+          "legendFormat": "expirations/s"
+        },
+        {
+          "expr": "rate(claim_extensions_total[5m])",
+          "legendFormat": "extensions/s"
+        }
+      ]
+    },
+    {
+      "title": "Stuck Jobs Detected",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "targets": [
+        {
+          "expr": "rate(stuck_jobs_detected_total[5m])",
+          "legendFormat": "detected/s"
+        },
+        {
+          "expr": "rate(stuck_jobs_recovered_total[5m])",
+          "legendFormat": "recovered/s"
+        }
+      ]
+    },
+    {
+      "title": "Workflow Checkpoint Resumes",
+      "description": "Workflows resumed from durable checkpoints after worker crash or stuck-job recovery",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "expr": "rate(workflow_checkpoint_resumes_total[5m])",
+          "legendFormat": "resumes/s"
+        }
+      ]
+    }
+  ],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s"
+}

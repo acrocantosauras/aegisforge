@@ -422,6 +422,7 @@ class ExecutionJob(BaseModel):
     trace_id: str = ""
     resume: bool = False
     approval_decision: str = ""
+    submitted_at: float = 0.0  # time.monotonic() at submission for queue-wait tracking
 
 
 class ApprovalRequest(BaseModel):

@@ -27,7 +27,7 @@ from aegisforge.async_execution.jobs import (
 )
 from aegisforge.config import Settings, get_model_provider_from_settings, get_settings
 from aegisforge.db.session import get_session_factory
-from aegisforge.observability.metrics import set_active_workers
+from aegisforge.observability.metrics import set_active_claims, set_active_workers
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +143,24 @@ def _create_job_handler(settings: Settings) -> Any:
                 store=checkpoint_store,
             )
 
-            # Execute the workflow with all dependencies
+            # Execute the workflow with all dependencies.
+            # Phase 6D: When a job is a retry (crash recovery or stuck-job
+            # recovery), resume from the last durable checkpoint instead of
+            # restarting the workflow from scratch.  This preserves all work
+            # completed before the failure.
             from aegisforge.workflows.langgraph_workflow import execute_workflow
+
+            is_retry_resume = job.retry_count > 0
+            if is_retry_resume:
+                logger.info(
+                    "Job %s is retry #%d — resuming from checkpoint",
+                    job.job_id, job.retry_count,
+                )
+                try:
+                    from aegisforge.observability.metrics import record_workflow_checkpoint_resume
+                    record_workflow_checkpoint_resume()
+                except Exception:  # noqa: S110 — observability must never break execution
+                    pass
 
             final_state = execute_workflow(
                 request_id=job.request_id,
@@ -153,6 +169,7 @@ def _create_job_handler(settings: Settings) -> Any:
                 organization_id=organization_id,
                 workflow_id=job.workflow_id,
                 checkpointer=checkpointer,
+                resume_from_checkpoint=is_retry_resume,
                 model_provider=model_provider,
                 retrieval_service=retrieval_service,
                 approval_service=approval_service,
@@ -401,6 +418,17 @@ def run_worker(settings: Settings | None = None) -> None:
                 if isinstance(queue, RedisJobQueue):
                     active = queue.get_active_workers()
                     set_active_workers(len(active))
+                    # Update active claims metric
+                    try:
+                        import time as _time
+
+                        now = _time.time()
+                        active_claims = queue._redis.zrangebyscore(
+                            "aegisforge:active_claims", str(now), "+inf"
+                        )
+                        set_active_claims(len(active_claims))
+                    except Exception:  # noqa: S110
+                        pass
             except Exception:  # noqa: S110 — observability must never break execution
                 pass
             time.sleep(_WORKER_HEARTBEAT_INTERVAL)
@@ -411,7 +439,20 @@ def run_worker(settings: Settings | None = None) -> None:
     heartbeat_thread.start()
 
     # Phase 6B: Start recovery scan thread
+    # Phase 6C: Also run stuck-job detection
     def _recovery_loop() -> None:
+        stuck_detector = None
+        if isinstance(queue, RedisJobQueue):
+            from aegisforge.async_execution.stuck_job_detector import (
+                StuckJobConfig,
+                StuckJobDetector,
+            )
+
+            stuck_detector = StuckJobDetector(
+                redis_client=queue._redis,
+                config=StuckJobConfig(),
+            )
+
         while not _shutdown_requested:
             try:
                 time.sleep(_RECOVERY_SCAN_INTERVAL)
@@ -423,6 +464,29 @@ def run_worker(settings: Settings | None = None) -> None:
                         "Worker [%s] recovered %d expired job(s): %s",
                         worker_id, len(recovered), recovered,
                     )
+
+                # Phase 6C: Stuck job detection
+                if stuck_detector is not None:
+                    from aegisforge.observability.metrics import (
+                        record_stuck_job_detected,
+                        record_stuck_job_recovered,
+                    )
+
+                    stuck_jobs = stuck_detector.scan_for_stuck_jobs()
+                    for stuck_info in stuck_jobs:
+                        record_stuck_job_detected()
+                        logger.warning(
+                            "Stuck job detected [%s]: %s",
+                            stuck_info.job_id,
+                            stuck_info.reason,
+                        )
+                        if stuck_detector.recover_stuck_job(stuck_info):
+                            record_stuck_job_recovered()
+                            logger.info(
+                                "Worker [%s] recovered stuck job %s",
+                                worker_id,
+                                stuck_info.job_id,
+                            )
             except Exception:  # noqa: S110 — observability must never break execution
                 pass
 

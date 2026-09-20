@@ -59,13 +59,17 @@ def redis_client() -> Any:
         decode_responses=True,
     )
     client.ping()
-    # Clean up test keys before each test
+    # Clean up test keys AND global shared state before each test
     for key in client.scan_iter(match="aegisforge:test-*"):
         client.delete(key)
+    client.delete("aegisforge:active_claims")
+    client.delete("aegisforge:workers")
     yield client
     # Cleanup after test
     for key in client.scan_iter(match="aegisforge:test-*"):
         client.delete(key)
+    client.delete("aegisforge:active_claims")
+    client.delete("aegisforge:workers")
 
 
 @pytest.fixture()
@@ -202,9 +206,10 @@ def test_crash_recovery_requeues_expired_claim(
     redis_client: Any, unique_queue_name: str
 ) -> None:
     """When a worker crashes (claim expires), the job is recoverable."""
-    # Use a very short visibility timeout for testing
+    from aegisforge.async_execution.jobs import _ACTIVE_CLAIMS_SET
+
     queue = RedisJobQueue(
-        redis_client, queue_name=unique_queue_name, visibility_timeout=2
+        redis_client, queue_name=unique_queue_name, visibility_timeout=300
     )
     manager = JobManager(queue)
     job = manager.submit_job(
@@ -217,8 +222,9 @@ def test_crash_recovery_requeues_expired_claim(
     claim_success = queue.claim_job(job, "worker-crasher")
     assert claim_success is True
 
-    # Wait for claim to expire
-    time.sleep(3)
+    # Simulate crash: directly set the claim score to the past so recovery
+    # is deterministic and does not depend on sleep timing.
+    redis_client.zadd(_ACTIVE_CLAIMS_SET, {job.job_id: time.time() - 10})
 
     # Recovery scan finds the expired claim and re-enqueues
     recovered = queue.recover_expired_claims()

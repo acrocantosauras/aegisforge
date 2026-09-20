@@ -1,0 +1,150 @@
+# AegisForge Prometheus Alert Rules
+# Phase 6C — Production Reliability & Observability
+#
+# These rules are designed to be consumed by a standard Alertmanager
+# deployment. Thresholds are based on operational reality, not arbitrary
+# assumptions. Adjust thresholds based on your environment.
+#
+# Usage:
+#   1. Add this file to your Prometheus rule_files configuration
+#   2. Configure Alertmanager to route these alerts
+#   3. Adjust thresholds to match your environment's baselines
+#
+# All rules use the 'aegisforge' namespace prefix from the OTel collector.
+
+groups:
+  - name: aegisforge-workers
+    rules:
+      # No healthy workers
+      - alert: NoHealthyWorkers
+        expr: active_workers == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No healthy workers available"
+          description: "AegisForge has no active workers. Jobs will queue but not execute."
+
+      # Worker heartbeat failures
+      - alert: WorkerHeartbeatFailures
+        expr: rate(worker_heartbeat_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker heartbeat failures detected"
+          description: "Worker heartbeat failures above 0.1/s for 5 minutes."
+
+      # Worker registration storm
+      - alert: WorkerRegistrationStorm
+        expr: rate(worker_registrations_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High worker registration rate"
+          description: "Workers are registering at >0.5/s — possible crash loop."
+
+  - name: aegisforge-queue
+    rules:
+      # Sustained queue growth
+      - alert: QueueGrowthSustained
+        expr: predict_linear(queue_depth[10m], 600) > queue_depth * 1.5 and queue_depth > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue depth growing sustained"
+          description: "Queue depth is predicted to grow 50% in 10 minutes. Workers may be overwhelmed."
+
+      # High job failure rate
+      - alert: HighJobFailureRate
+        expr: rate(queue_jobs_total{status="failed"}[5m]) / rate(queue_jobs_total{status="queued"}[5m]) > 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High job failure rate"
+          description: "More than 30% of jobs are failing. Check worker logs."
+
+      # Excessive job age (queued too long)
+      - alert: ExcessiveJobAge
+        expr: histogram_quantile(0.95, queue_wait_time_seconds_bucket) > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jobs waiting too long in queue"
+          description: "95th percentile queue wait time exceeds 5 minutes."
+
+      # Repeated job recovery
+      - alert: RepeatedJobRecovery
+        expr: rate(jobs_recovered_total[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent job recovery events"
+          description: "Jobs being recovered at >0.05/s — possible worker instability."
+
+      # Terminal failures
+      - alert: HighTerminalFailureRate
+        expr: rate(queue_jobs_abandoned_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jobs reaching terminal failure"
+          description: "Jobs are being permanently abandoned at >0.01/s."
+
+  - name: aegisforge-infrastructure
+    rules:
+      # Redis unavailable (detected via readiness probe failure)
+      - alert: RedisUnavailable
+        expr: up{job="aegisforge-api"} == 1 and absent(up{job="redis"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is unreachable"
+          description: "Redis cannot be scraped. Queue operations may fail."
+
+      # PostgreSQL unavailable (detected via readiness probe)
+      - alert: PostgreSQLUnavailable
+        expr: http_requests_total{endpoint="/api/v1/ready", status="503"} > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is unreachable"
+          description: "The /ready endpoint is returning 503. Database may be down."
+
+      # API error rate high
+      - alert: HighAPIErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API 5xx error rate"
+          description: "More than 5% of API requests are returning 5xx errors."
+
+      # Stuck jobs detected
+      - alert: StuckJobsDetected
+        expr: rate(stuck_jobs_detected_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stuck jobs detected"
+          description: "The stuck job detector has found stuck jobs. Check worker health."
+
+      # Excessive workflow checkpoint resumes (may indicate systemic issue)
+      - alert: ExcessiveCheckpointResumes
+        expr: rate(workflow_checkpoint_resumes_total[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High workflow checkpoint resume rate"
+          description: "Workflows are resuming from checkpoints at >0.1/s for 10 minutes. This may indicate frequent worker crashes or a systemic issue."

@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     job_max_retries: int = Field(default=3)
     job_timeout_seconds: int = Field(default=300)
 
+    # Phase 6C — Reliability & Observability
+    stuck_job_detection_enabled: bool = Field(default=True)
+    stuck_job_max_age_seconds: float = Field(default=3600.0)
+    stuck_job_max_claim_age_seconds: float = Field(default=600.0)
+    stuck_job_max_execution_time_seconds: float = Field(default=1800.0)
+    stuck_job_max_recoveries: int = Field(default=5)
+    worker_heartbeat_interval_seconds: int = Field(default=30)
+    worker_recovery_scan_interval_seconds: int = Field(default=60)
+
     # Approval Settings
     approval_required_risk_levels: str = Field(default="high,critical")
     approval_timeout_hours: int = Field(default=24)

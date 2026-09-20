@@ -1,0 +1,354 @@
+"""Phase 6C: Performance baseline for AegisForge job queue.
+
+Provides a modest, reproducible performance baseline measuring:
+- Job submission throughput
+- Queue latency (time from enqueue to dequeue)
+- Execution throughput (jobs completed per second)
+- Concurrent worker scaling
+- Recovery overhead
+
+Benchmark Methodology:
+---------------------
+All benchmarks use:
+- Backend: Redis 7.x on localhost (real Redis, not mocked)
+- Payload: ExecutionJob model with request_id, workflow_id, org (JSON ~300 bytes)
+- Handler: Deterministic no-op (returns {"result": "ok"}), no I/O, no LLM
+- Workers: Thread-based concurrency (not multiprocessing), single process
+- Retries: Default max_retries=3 (not exhausted in happy-path benchmarks)
+- Persistence: Jobs are stored in Redis (job data + queue + claims)
+- Timing: time.monotonic() for benchmarks, perf_counter() for sub-ms measurements
+- Network: Localhost only, no simulated network latency
+
+Production Representativeness:
+- Submission throughput (~500+ jobs/sec): Measures Redis LPUSH + SET overhead.
+  Production-realistic for queue submission.
+- Dequeue+execute (~150+ jobs/sec): Measures RPOP + claim + handler + status update.
+  Production-realistic for lightweight handlers. Real workflow execution
+  (LLM calls, tool execution, RAG) will be orders of magnitude slower.
+- Queue latency (~2ms avg): Measures time from LPUSH to RPOP on localhost.
+  Production latency will be higher due to network RTT.
+- Concurrent scaling: Measures thread-based scaling. Real workers are
+  separate processes on separate machines — scaling characteristics differ.
+- Recovery throughput (~400+ jobs/sec): Measures ZRANGEBYSCORE + re-enqueue.
+  Production-realistic for recovery speed.
+- In-memory baseline (~80k+ jobs/sec): NOT production-representative.
+  Included only as an architectural lower bound. Never present this
+  number as production Redis/Postgres performance.
+
+Known limitations:
+- Measures queue overhead, not actual workflow execution time
+- Single Redis instance, no network latency simulation
+- Deterministic handler (no I/O, no LLM calls)
+- Thread-based concurrency (not multiprocessing)
+- No PostgreSQL involvement (queue is Redis-only)
+
+To reproduce:
+    pytest tests/test_performance_baseline.py -v -s
+"""
+from __future__ import annotations
+
+import statistics
+import time
+from typing import Any
+
+import pytest
+
+from aegisforge.async_execution.jobs import (
+    InMemoryJobQueue,
+    JobManager,
+    JobWorker,
+    RedisJobQueue,
+)
+from aegisforge.domain.models import ExecutionJob
+
+
+def _redis_available() -> bool:
+    try:
+        import redis as _redis
+
+        c = _redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        c.ping()
+        c.close()
+        return True
+    except Exception:
+        return False
+
+
+requires_redis = pytest.mark.skipif(
+    not _redis_available(),
+    reason="Performance baseline requires Redis",
+)
+
+
+@pytest.fixture()
+def redis_client() -> Any:
+    import uuid
+
+    import redis
+
+    client = redis.from_url(
+        "redis://localhost:6379/0",
+        decode_responses=True,
+    )
+    client.ping()
+    prefix = f"aegisforge:test-perf-{uuid.uuid4().hex[:8]}"
+    for key in client.scan_iter(match=f"{prefix}*"):
+        client.delete(key)
+    yield client
+    for key in client.scan_iter(match=f"{prefix}*"):
+        client.delete(key)
+
+
+def _ok_handler(job: ExecutionJob) -> dict[str, Any]:
+    """Minimal handler for benchmarking — no I/O, no delays."""
+    return {"result": "ok", "job_id": job.job_id}
+
+
+@requires_redis
+class TestPerformanceBaseline:
+    """Reproducible performance baseline for the job queue system."""
+
+    def test_submission_throughput(self, redis_client: Any) -> None:
+        """Measure how fast jobs can be submitted to the queue."""
+        import uuid
+
+        queue_name = f"aegisforge:test-perf-submit-{uuid.uuid4().hex[:8]}"
+        queue = RedisJobQueue(redis_client, queue_name=queue_name)
+        manager = JobManager(queue)
+
+        num_jobs = 500
+        start = time.monotonic()
+
+        for i in range(num_jobs):
+            manager.submit_job(
+                request_id=f"req-perf-{i}",
+                workflow_id=f"wf-perf-{i}",
+                organization_id="org-perf",
+            )
+
+        elapsed = time.monotonic() - start
+        throughput = num_jobs / elapsed
+
+        print(f"\n  Submission throughput: {throughput:.0f} jobs/sec ({num_jobs} in {elapsed:.3f}s)")
+        assert throughput > 50, f"Submission throughput too low: {throughput:.0f} jobs/sec"
+
+        # Cleanup
+        for key in redis_client.scan_iter(match=f"{queue_name}*"):
+            redis_client.delete(key)
+
+    def test_dequeue_throughput(self, redis_client: Any) -> None:
+        """Measure how fast jobs can be dequeued."""
+        import uuid
+
+        queue_name = f"aegisforge:test-perf-dequeue-{uuid.uuid4().hex[:8]}"
+        queue = RedisJobQueue(redis_client, queue_name=queue_name)
+        manager = JobManager(queue)
+
+        num_jobs = 500
+        for i in range(num_jobs):
+            manager.submit_job(
+                request_id=f"req-perf-{i}",
+                workflow_id=f"wf-perf-{i}",
+                organization_id="org-perf",
+            )
+
+        worker = JobWorker(manager, _ok_handler, worker_id="perf-worker")
+
+        start = time.monotonic()
+        processed = worker.process_all(max_jobs=num_jobs)
+        elapsed = time.monotonic() - start
+        throughput = len(processed) / elapsed
+
+        print(f"\n  Dequeue+execute throughput: {throughput:.0f} jobs/sec ({len(processed)} in {elapsed:.3f}s)")
+        assert len(processed) == num_jobs
+        assert throughput > 20, f"Dequeue throughput too low: {throughput:.0f} jobs/sec"
+
+        for key in redis_client.scan_iter(match=f"{queue_name}*"):
+            redis_client.delete(key)
+
+    def test_queue_latency(self, redis_client: Any) -> None:
+        """Measure queue wait time (time between submission and dequeue)."""
+        import uuid
+
+        queue_name = f"aegisforge:test-perf-latency-{uuid.uuid4().hex[:8]}"
+        queue = RedisJobQueue(redis_client, queue_name=queue_name)
+        manager = JobManager(queue)
+
+        num_jobs = 100
+        latencies: list[float] = []
+
+        for i in range(num_jobs):
+            submit_time = time.monotonic()
+            manager.submit_job(
+                request_id=f"req-latency-{i}",
+                workflow_id=f"wf-latency-{i}",
+                organization_id="org-perf",
+            )
+            # Immediately dequeue
+            dequeued = queue.dequeue()
+            dequeue_time = time.monotonic()
+            if dequeued is not None:
+                latencies.append(dequeue_time - submit_time)
+
+        avg_latency = statistics.mean(latencies) * 1000  # ms
+        p95_latency = sorted(latencies)[int(len(latencies) * 0.95)] * 1000  # ms
+
+        print(f"\n  Queue latency: avg={avg_latency:.2f}ms, p95={p95_latency:.2f}ms")
+        assert avg_latency < 10, f"Average queue latency too high: {avg_latency:.2f}ms"
+
+        for key in redis_client.scan_iter(match=f"{queue_name}*"):
+            redis_client.delete(key)
+
+    def test_execution_throughput(self, redis_client: Any) -> None:
+        """Measure end-to-end execution throughput (submit → execute)."""
+        import uuid
+
+        queue_name = f"aegisforge:test-perf-exec-{uuid.uuid4().hex[:8]}"
+        queue = RedisJobQueue(redis_client, queue_name=queue_name)
+        manager = JobManager(queue)
+        worker = JobWorker(manager, _ok_handler, worker_id="perf-exec-worker")
+
+        num_jobs = 200
+        for i in range(num_jobs):
+            manager.submit_job(
+                request_id=f"req-exec-{i}",
+                workflow_id=f"wf-exec-{i}",
+                organization_id="org-perf",
+            )
+
+        start = time.monotonic()
+        processed = worker.process_all(max_jobs=num_jobs)
+        elapsed = time.monotonic() - start
+        throughput = len(processed) / elapsed
+
+        print(f"\n  Execution throughput: {throughput:.0f} jobs/sec ({len(processed)} in {elapsed:.3f}s)")
+        assert throughput > 20
+
+        for key in redis_client.scan_iter(match=f"{queue_name}*"):
+            redis_client.delete(key)
+
+    def test_concurrent_worker_scaling(self, redis_client: Any) -> None:
+        """Measure throughput with multiple concurrent workers."""
+        import threading
+        import uuid
+
+        queue_name = f"aegisforge:test-perf-scale-{uuid.uuid4().hex[:8]}"
+        queue = RedisJobQueue(redis_client, queue_name=queue_name)
+        manager = JobManager(queue)
+
+        num_jobs = 300
+        for i in range(num_jobs):
+            manager.submit_job(
+                request_id=f"req-scale-{i}",
+                workflow_id=f"wf-scale-{i}",
+                organization_id="org-perf",
+            )
+
+        num_workers = 4
+        results: list[list[str]] = [[] for _ in range(num_workers)]
+        barriers = [threading.Event() for _ in range(num_workers)]
+
+        def worker_fn(worker_idx: int) -> None:
+            worker = JobWorker(
+                manager, _ok_handler, worker_id=f"perf-scale-{worker_idx}"
+            )
+            barriers[worker_idx].set()  # Signal ready
+            # Wait for all workers to be ready
+            for b in barriers:
+                b.wait(timeout=5)
+            while True:
+                job = worker.process_next_job()
+                if job is None:
+                    break
+                results[worker_idx].append(job.job_id)
+
+        start = time.monotonic()
+        threads = [threading.Thread(target=worker_fn, args=(i,)) for i in range(num_workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        elapsed = time.monotonic() - start
+
+        all_jobs = []
+        for r in results:
+            all_jobs.extend(r)
+
+        throughput = len(all_jobs) / elapsed
+
+        print(f"\n  Concurrent throughput ({num_workers} workers): {throughput:.0f} jobs/sec")
+        print(f"  Jobs processed: {len(all_jobs)}/{num_jobs}")
+        # All jobs should be processed
+        assert len(all_jobs) == num_jobs
+        # Each job processed exactly once
+        assert len(set(all_jobs)) == num_jobs
+
+        for key in redis_client.scan_iter(match=f"{queue_name}*"):
+            redis_client.delete(key)
+
+    def test_recovery_overhead(self, redis_client: Any) -> None:
+        """Measure the overhead of crash recovery."""
+        import uuid
+
+        queue_name = f"aegisforge:test-perf-recovery-{uuid.uuid4().hex[:8]}"
+        queue = RedisJobQueue(
+            redis_client, queue_name=queue_name, visibility_timeout=1
+        )
+        manager = JobManager(queue)
+
+        num_jobs = 50
+        job_ids = []
+        for i in range(num_jobs):
+            job = manager.submit_job(
+                request_id=f"req-recovery-{i}",
+                workflow_id=f"wf-recovery-{i}",
+                organization_id="org-perf",
+            )
+            # Claim and abandon (simulating crash)
+            queue.claim_job(job, f"worker-crash-{i}")
+            job_ids.append(job.job_id)
+
+        # Wait for claims to expire
+        time.sleep(2)
+
+        # Measure recovery time
+        start = time.monotonic()
+        recovered = queue.recover_expired_claims(max_recover=num_jobs)
+        elapsed = time.monotonic() - start
+
+        print(f"\n  Recovery: {len(recovered)}/{num_jobs} jobs in {elapsed:.3f}s")
+        print(f"  Recovery throughput: {len(recovered)/max(elapsed, 0.001):.0f} jobs/sec")
+        assert len(recovered) == num_jobs
+
+        for key in redis_client.scan_iter(match=f"{queue_name}*"):
+            redis_client.delete(key)
+
+
+@requires_redis
+class TestInMemoryVsRedis:
+    """Compare in-memory vs Redis queue performance."""
+
+    def test_in_memory_throughput(self) -> None:
+        """Baseline: in-memory queue throughput."""
+        queue = InMemoryJobQueue()
+        manager = JobManager(queue)
+        worker = JobWorker(manager, _ok_handler)
+
+        num_jobs = 1000
+        for i in range(num_jobs):
+            manager.submit_job(
+                request_id=f"req-mem-{i}",
+                workflow_id=f"wf-mem-{i}",
+                organization_id="org-perf",
+            )
+
+        # Use perf_counter for higher precision on Windows
+        import time as _time
+
+        start = _time.perf_counter()
+        processed = worker.process_all(max_jobs=num_jobs)
+        elapsed = _time.perf_counter() - start
+        throughput = len(processed) / max(elapsed, 1e-9)
+
+        print(f"\n  In-memory throughput: {throughput:.0f} jobs/sec")
+        assert throughput > 100

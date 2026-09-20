@@ -1,0 +1,165 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "title": "AegisForge Workers",
+  "uid": "aegisforge-workers",
+  "panels": [
+    {
+      "title": "Active Workers",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "active_workers",
+          "legendFormat": "workers"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "red" },
+              { "value": 1, "color": "green" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Worker Registrations",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(worker_registrations_total[5m])",
+          "legendFormat": "registrations/s"
+        },
+        {
+          "expr": "rate(worker_deregistrations_total[5m])",
+          "legendFormat": "deregistrations/s"
+        }
+      ]
+    },
+    {
+      "title": "Worker Heartbeats",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(worker_heartbeat_failures_total[5m])",
+          "legendFormat": "heartbeat failures/s"
+        }
+      ]
+    },
+    {
+      "title": "Worker Events",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(worker_events_total{status=\"claimed\"}[5m])",
+          "legendFormat": "claimed/s"
+        },
+        {
+          "expr": "rate(worker_events_total{status=\"completed\"}[5m])",
+          "legendFormat": "completed/s"
+        },
+        {
+          "expr": "rate(worker_events_total{status=\"failed\"}[5m])",
+          "legendFormat": "failed/s"
+        }
+      ]
+    },
+    {
+      "title": "Jobs per Worker",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "active_workers",
+          "legendFormat": "active workers"
+        },
+        {
+          "expr": "active_claims",
+          "legendFormat": "active claims (jobs in progress)"
+        }
+      ]
+    },
+    {
+      "title": "Worker Job Distribution",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "rate(queue_jobs_dequeued_total[5m])",
+          "legendFormat": "dequeued/s"
+        },
+        {
+          "expr": "rate(queue_jobs_claimed_total[5m])",
+          "legendFormat": "claimed/s"
+        },
+        {
+          "expr": "rate(worker_events_total{status=\"completed\"}[5m])",
+          "legendFormat": "completed/s"
+        }
+      ]
+    },
+    {
+      "title": "Worker Availability",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "active_workers > 0",
+          "legendFormat": "has workers"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NO WORKERS", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "OK", "color": "green" } } }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Queue Depth vs Active Workers",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "targets": [
+        {
+          "expr": "queue_depth",
+          "legendFormat": "queue depth"
+        },
+        {
+          "expr": "active_workers",
+          "legendFormat": "active workers"
+        }
+      ]
+    },
+    {
+      "title": "Recovery Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(jobs_recovered_total[5m])",
+          "legendFormat": "recovered/s"
+        },
+        {
+          "expr": "rate(stuck_jobs_detected_total[5m])",
+          "legendFormat": "stuck detected/s"
+        },
+        {
+          "expr": "rate(stuck_jobs_recovered_total[5m])",
+          "legendFormat": "stuck recovered/s"
+        }
+      ]
+    }
+  ],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s"
+}

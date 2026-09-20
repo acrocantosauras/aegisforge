@@ -22,9 +22,17 @@ from typing import Any
 
 from aegisforge.domain.models import ExecutionJob, ExecutionJobStatus
 from aegisforge.observability.metrics import (
+    record_claim_expiration,
+    record_claim_extension,
+    record_job_abandoned,
+    record_job_claimed,
+    record_job_dequeued,
     record_job_duration,
+    record_job_recovered,
     record_queue_event,
+    record_queue_wait_time,
     record_worker_event,
+    record_worker_heartbeat_failure,
     set_queue_depth,
 )
 
@@ -130,6 +138,7 @@ class RedisJobQueue(JobQueue):
         try:
             data = self._redis.rpop(self._queue_name)
             if data:
+                record_job_dequeued()
                 return ExecutionJob.model_validate_json(data)
             return None
         except Exception:
@@ -186,6 +195,7 @@ class RedisJobQueue(JobQueue):
                 self._redis.zadd(_ACTIVE_CLAIMS_SET, {job.job_id: expires_at})
                 # Persist full job data for distributed access
                 self._store_job_data(job)
+                record_job_claimed()
                 return True
             return False
         except Exception:
@@ -203,10 +213,12 @@ class RedisJobQueue(JobQueue):
                 # Update sorted set expiration timestamp
                 expires_at = time.time() + self._visibility_timeout
                 self._redis.zadd(_ACTIVE_CLAIMS_SET, {job_id: expires_at})
+                record_claim_extension()
                 return True
             return False
         except Exception:
             logger.warning("Failed to heartbeat job %s", job_id)
+            record_worker_heartbeat_failure()
             return False
 
     def release_claim(self, job_id: str, worker_id: str) -> None:
@@ -329,6 +341,7 @@ class RedisJobQueue(JobQueue):
             for job_id in expired_job_ids:
                 if len(recovered) >= max_recover:
                     break
+                record_claim_expiration()
                 # Remove from the sorted set (we're processing this claim)
                 self._redis.zrem(_ACTIVE_CLAIMS_SET, job_id)
                 # Also clean up the claim key if it still lingers
@@ -351,6 +364,7 @@ class RedisJobQueue(JobQueue):
                         ExecutionJobStatus.FAILED,
                         error="Worker crashed; max retries exceeded",
                     )
+                    record_job_abandoned()
                     continue
                 # Re-enqueue for another worker
                 job.retry_count += 1
@@ -358,6 +372,7 @@ class RedisJobQueue(JobQueue):
                 self._store_job_data(job)
                 self.enqueue(job)
                 recovered.append(job_id)
+                record_job_recovered()
                 logger.info(
                     "Recovered expired job %s (attempt %d/%d)",
                     job_id, job.retry_count, job.max_retries,
@@ -374,6 +389,9 @@ class RedisJobQueue(JobQueue):
         """Register a worker heartbeat in the sorted set."""
         try:
             self._redis.zadd(_WORKERS_SET, {worker_id: time.time()})
+            from aegisforge.observability.metrics import record_worker_registration
+
+            record_worker_registration()
         except Exception:
             logger.warning("Failed to register worker %s", worker_id)
 
@@ -388,6 +406,9 @@ class RedisJobQueue(JobQueue):
         """Remove a worker from the registry."""
         try:
             self._redis.zrem(_WORKERS_SET, worker_id)
+            from aegisforge.observability.metrics import record_worker_deregistration
+
+            record_worker_deregistration()
         except Exception:  # noqa: S110 — observability must never break execution
             pass
 
@@ -488,6 +509,7 @@ class JobManager:
             max_retries=max_retries,
             idempotency_key=idempotency_key or f"job-{uuid.uuid4().hex[:16]}",
             trace_id=trace_id,
+            submitted_at=time.monotonic(),
         )
 
         self._jobs[job.job_id] = job
@@ -644,6 +666,10 @@ class JobWorker:
         set_queue_depth(self._job_manager._queue.size())
         start_time = time.monotonic()
         self._active_job_id = job.job_id
+
+        # Track queue wait time
+        if job.submitted_at > 0:
+            record_queue_wait_time(start_time - job.submitted_at)
 
         # Phase 6B: Atomic claim verification
         if isinstance(self._job_manager._queue, RedisJobQueue):
