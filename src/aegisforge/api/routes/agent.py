@@ -80,7 +80,19 @@ def list_agents(
 
 
 @router.post("/research")
-def run_research_agent(payload: dict, db: Session = Depends(get_db)) -> dict:
+def run_research_agent(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: UserModel = Depends(get_current_user),
+) -> dict:
+    """Run the research agent with an authenticated, token-derived context.
+
+    SECURITY: this endpoint executes a real tool pipeline, so it requires
+    authentication, and the execution identity (user/organization) is taken
+    from the verified bearer token — NEVER from the request body.  Client-
+    supplied ``user_id``/``organization_id`` fields are ignored so an
+    anonymous or authenticated caller cannot spoof another tenant's context.
+    """
     registry = get_tool_registry()
     agent = ResearchAgent(
         name="research-agent",
@@ -89,9 +101,9 @@ def run_research_agent(payload: dict, db: Session = Depends(get_db)) -> dict:
         registry=registry,
     )
     context = AgentExecutionContext(
-        request_id=payload.get("request_id", "req-demo"),
-        user_id=payload.get("user_id", "user-demo"),
-        organization_id=payload.get("organization_id", "org-demo"),
+        request_id=str(payload.get("request_id", "req-demo")),
+        user_id=user.id,
+        organization_id=user.organization_id,
         permissions=[PermissionSpec(name="knowledge.search", allow=True)],
     )
     result = agent.execute({"query": str(payload.get("query", ""))}, context)

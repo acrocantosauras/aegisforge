@@ -12,6 +12,7 @@ Uses real Redis to prove actual distributed queue semantics.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -30,12 +31,19 @@ from aegisforge.domain.models import ExecutionJob, ExecutionJobStatus
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
+def _test_redis_url() -> str:
+    """Redis URL for tests (honors AEGISFORGE_TEST_REDIS_URL for authed Redis)."""
+    return os.environ.get(
+        "AEGISFORGE_TEST_REDIS_URL", "redis://localhost:6379/0"
+    )
+
 def _redis_available() -> bool:
     """Check if a real Redis instance is reachable."""
     try:
         import redis as _redis
 
-        c = _redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        c = _redis.from_url(_test_redis_url(), decode_responses=True)
         c.ping()
         c.close()
         return True
@@ -55,7 +63,7 @@ def redis_client() -> Any:
     import redis
 
     client = redis.from_url(
-        "redis://localhost:6379/0",
+        _test_redis_url(),
         decode_responses=True,
     )
     client.ping()
@@ -63,12 +71,14 @@ def redis_client() -> Any:
     for key in client.scan_iter(match="aegisforge:test-*"):
         client.delete(key)
     client.delete("aegisforge:active_claims")
+    client.delete("aegisforge:active_claims:recovery_lock")
     client.delete("aegisforge:workers")
     yield client
     # Cleanup after test
     for key in client.scan_iter(match="aegisforge:test-*"):
         client.delete(key)
     client.delete("aegisforge:active_claims")
+    client.delete("aegisforge:active_claims:recovery_lock")
     client.delete("aegisforge:workers")
 
 

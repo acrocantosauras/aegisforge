@@ -482,14 +482,14 @@ class TestF14_ApprovalTenantIsolationAPI:
             risk_level=RiskLevel.HIGH,
         )
 
-        # Org-2 should not be able to approve org-1's approval
+        # Org-2 cannot approve org-1's approval — 404, never 403 (no oracle)
         headers2 = {"Authorization": f"Bearer {token2}"}
         resp = client.post(
             f"/api/v1/approvals/{approval.approval_id}/approve",
             json={"decision_reason": "Trying to approve cross-tenant"},
             headers=headers2,
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
 
 class TestConfigHelpers:

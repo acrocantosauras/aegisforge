@@ -83,7 +83,16 @@ class StuckJobDetector:
 
     Recovery is bounded: each job can only be recovered a limited number
     of times before it's marked as terminally failed.
+
+    Phase 6G hardening:
+    - Recovery counts are tracked in Redis (bounded TTL), not in an
+      unbounded process-local dict, so they survive restarts, are shared
+      across workers, and cannot leak memory.
+    - Age comparisons use wall-clock timestamps consistently.
     """
+
+    _RECOVERY_COUNTS_KEY = "aegisforge:stuck_job_recovery_counts"
+    _RECOVERY_COUNT_TTL = 86400  # 24h: bounded, well above any scan cadence
 
     def __init__(
         self,
@@ -92,7 +101,21 @@ class StuckJobDetector:
     ) -> None:
         self._redis = redis_client
         self._config = config or StuckJobConfig()
-        self._recovery_counts: dict[str, int] = {}
+
+    def _get_recovery_count(self, job_id: str) -> int:
+        try:
+            value = self._redis.hget(self._RECOVERY_COUNTS_KEY, job_id)
+            return int(value) if value else 0
+        except Exception:
+            return 0
+
+    def _increment_recovery_count(self, job_id: str) -> int:
+        try:
+            count = self._redis.hincrby(self._RECOVERY_COUNTS_KEY, job_id, 1)
+            self._redis.expire(self._RECOVERY_COUNTS_KEY, self._RECOVERY_COUNT_TTL)
+            return int(count)
+        except Exception:
+            return self._get_recovery_count(job_id) + 1
 
     @property
     def config(self) -> StuckJobConfig:
@@ -221,7 +244,7 @@ class StuckJobDetector:
             reason=reason,
             age_seconds=now - submitted_at if submitted_at > 0 else 0,
             claim_age_seconds=claim_age,
-            recovery_count=self._recovery_counts.get(job_id, 0),
+            recovery_count=self._get_recovery_count(job_id),
         )
 
     def _check_stuck_queued(
@@ -247,17 +270,19 @@ class StuckJobDetector:
             ),
             age_seconds=age,
             claim_age_seconds=0,
-            recovery_count=self._recovery_counts.get(job.job_id, 0),
+            recovery_count=self._get_recovery_count(job.job_id),
         )
 
     def recover_stuck_job(self, stuck_info: StuckJobInfo) -> bool:
         """Attempt to recover a stuck job.
 
-        Bounded recovery: each job can only be recovered max_recoveries times.
+        Bounded recovery: each job can only be recovered max_recoveries times
+        (counted in Redis, shared across workers, TTL-bounded).
+
         Returns True if recovery was attempted.
         """
         job_id = stuck_info.job_id
-        current_count = self._recovery_counts.get(job_id, 0)
+        current_count = self._get_recovery_count(job_id)
 
         if current_count >= self._config.max_recoveries:
             logger.warning(
@@ -268,8 +293,6 @@ class StuckJobDetector:
             # Mark as terminally failed
             self._mark_terminal_failure(job_id, stuck_info)
             return False
-
-        self._recovery_counts[job_id] = current_count + 1
 
         try:
             # Remove from active claims
@@ -304,9 +327,11 @@ class StuckJobDetector:
                 self._mark_terminal_failure(job_id, stuck_info)
                 return False
 
-            # Re-enqueue
+            # Re-enqueue: persist updated state BEFORE pushing to the queue
+            # (same ordering fix as RedisJobQueue.recover_expired_claims).
             job.retry_count += 1
             job.status = ExecutionJobStatus.RETRYING
+            self._increment_recovery_count(job_id)
             self._redis.set(key, job.model_dump_json(), ex=3600)
             self._redis.lpush(_JOBS_QUEUE, job.model_dump_json())
 
@@ -355,8 +380,11 @@ class StuckJobDetector:
 
     def get_recovery_count(self, job_id: str) -> int:
         """Return how many times a job has been recovered."""
-        return self._recovery_counts.get(job_id, 0)
+        return self._get_recovery_count(job_id)
 
     def reset_recovery_counts(self) -> None:
         """Reset all recovery counts (for testing)."""
-        self._recovery_counts.clear()
+        try:
+            self._redis.delete(self._RECOVERY_COUNTS_KEY)
+        except Exception:  # noqa: S110 — best-effort cleanup
+            pass

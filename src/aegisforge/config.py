@@ -3,10 +3,28 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+# Placeholder secret keys that must never reach a production process.
+_INSECURE_SECRET_KEYS = frozenset(
+    {
+        "",
+        "dev-secret-key-change-me",
+        "change-me-in-production",
+        "change-me",
+        "changeme",
+        "secret",
+        "test-secret",
+    }
+)
+
+_PRODUCTION_ENVIRONMENTS = frozenset({"production", "prod"})
+
+# Minimum secret length for production (OWASP credential guidance).
+_MIN_PRODUCTION_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -66,6 +84,25 @@ class Settings(BaseSettings):
     worker_heartbeat_interval_seconds: int = Field(default=30)
     worker_recovery_scan_interval_seconds: int = Field(default=60)
 
+    # Phase 6F — Tool health (bounded evidence windows and thresholds)
+    tool_health_window_size: int = Field(default=20)
+    tool_health_min_samples: int = Field(default=3)
+    tool_health_degraded_failure_rate: float = Field(default=0.34)
+    tool_health_unavailable_failure_rate: float = Field(default=0.75)
+    tool_health_degraded_consecutive_failures: int = Field(default=2)
+    tool_health_unavailable_consecutive_failures: int = Field(default=4)
+    tool_health_recovery_samples: int = Field(default=2)
+
+    # Phase 6G — Tool circuit breaker (fast-fail around repeatedly failing tools)
+    tool_circuit_failure_threshold: int = Field(default=5)
+    tool_circuit_failure_window_seconds: float = Field(default=60.0)
+    tool_circuit_cooldown_seconds: float = Field(default=30.0)
+    tool_circuit_max_probes_per_open: int = Field(default=3)
+
+    # Phase 6G — Worker capacity awareness (application-level, bounded)
+    worker_capacity: int = Field(default=1)
+    worker_capacity_stale_after_seconds: int = Field(default=90)
+
     # Approval Settings
     approval_required_risk_levels: str = Field(default="high,critical")
     approval_timeout_hours: int = Field(default=24)
@@ -104,6 +141,53 @@ class Settings(BaseSettings):
     rate_limit_window_seconds: int = Field(default=60)
     rate_limit_auth_max_requests: int = Field(default=600)
     rate_limit_exempt_paths: str = Field(default="/metrics,/api/v1/health,/docs,/redoc,/openapi.json")
+
+    @model_validator(mode="after")
+    def _validate_production_security(self) -> Settings:
+        """Fail fast on insecure production configuration (WS4).
+
+        A production process must never start with a placeholder/short
+        SECRET_KEY (every JWT, session, and signed value would be forgeable)
+        or with debug mode enabled.  Development and test environments keep
+        working defaults so the local loop is unaffected.
+        """
+        environment = (self.environment or "").strip().lower()
+        if environment not in _PRODUCTION_ENVIRONMENTS:
+            return self
+
+        key = (self.secret_key or "").strip()
+        lowered = key.lower()
+        placeholder = (
+            key in _INSECURE_SECRET_KEYS
+            or "change-me" in lowered
+            or "changeme" in lowered
+            or "change_me" in lowered
+            or "dev-secret" in lowered
+        )
+        if placeholder:
+            raise ValueError(
+                "Refusing to start: SECRET_KEY is a placeholder/insecure value "
+                "while environment=production. Generate one with "
+                "`python -c \"import secrets; print(secrets.token_urlsafe(48))\"` "
+                "and set SECRET_KEY."
+            )
+        if len(key) < _MIN_PRODUCTION_SECRET_LENGTH:
+            message = (
+                f"Refusing to start: SECRET_KEY must be at least "
+                f"{_MIN_PRODUCTION_SECRET_LENGTH} characters in production "
+                f"(got {len(key)})."
+            )
+            raise ValueError(message)
+        if self.debug:
+            raise ValueError(
+                "Refusing to start: DEBUG must be false when environment=production."
+            )
+        if not self.rate_limit_enabled:
+            logger.warning(
+                "SECURITY: rate limiting is DISABLED in production "
+                "(rate_limit_enabled=false) — set RATE_LIMIT_ENABLED=true."
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

@@ -103,7 +103,7 @@ def test_production_async_execution_fails_closed_without_redis(monkeypatch) -> N
         environment="production",
         database_url="sqlite:///:memory:",
         redis_url="redis://localhost:6379/0",
-        secret_key="phase5-production-test-secret",
+        secret_key="phase5-production-test-secret-0123456789abcdef",
     )
     get_engine.cache_clear()
     Base.metadata.create_all(bind=get_engine(settings.database_url))

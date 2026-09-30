@@ -5,6 +5,7 @@ within configurable bounds.
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -17,11 +18,17 @@ from aegisforge.async_execution.stuck_job_detector import (
 )
 
 
+def _test_redis_url() -> str:
+    """Redis URL for tests (honors AEGISFORGE_TEST_REDIS_URL for authed Redis)."""
+    return os.environ.get(
+        "AEGISFORGE_TEST_REDIS_URL", "redis://localhost:6379/0"
+    )
+
 def _redis_available() -> bool:
     try:
         import redis as _redis
 
-        c = _redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        c = _redis.from_url(_test_redis_url(), decode_responses=True)
         c.ping()
         c.close()
         return True
@@ -39,17 +46,21 @@ requires_redis = pytest.mark.skipif(
 def redis_client() -> Any:
     import redis
 
-    client = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    client = redis.from_url(_test_redis_url(), decode_responses=True)
     client.ping()
     for key in client.scan_iter(match="aegisforge:test-*"):
         client.delete(key)
     client.delete("aegisforge:active_claims")
     client.delete("aegisforge:workers")
+    # Phase 6G: recovery counts are Redis-backed (shared, TTL-bounded) —
+    # they must be reset between tests like every other piece of state.
+    client.delete("aegisforge:stuck_job_recovery_counts")
     yield client
     for key in client.scan_iter(match="aegisforge:test-*"):
         client.delete(key)
     client.delete("aegisforge:active_claims")
     client.delete("aegisforge:workers")
+    client.delete("aegisforge:stuck_job_recovery_counts")
 
 
 class TestStuckJobConfig:
@@ -209,7 +220,10 @@ class TestStuckJobDetector:
             redis_client=redis_client,
             config=StuckJobConfig(),
         )
-        detector._recovery_counts["job-1"] = 3
+        # Phase 6G: counts are Redis-backed (bounded, shared across workers)
+        # instead of an unbounded process-local dict.
+        redis_client.hset("aegisforge:stuck_job_recovery_counts", "job-1", 3)
+        assert detector.get_recovery_count("job-1") == 3
         detector.reset_recovery_counts()
         assert detector.get_recovery_count("job-1") == 0
 
@@ -225,3 +239,55 @@ class TestStuckJobDetector:
         assert info.job_id == "job-test"
         assert info.status == "running"
         assert info.claim_age_seconds == 500.0
+
+
+# ---------------------------------------------------------------------------
+# Test: Settings → StuckJobConfig wiring (worker must respect env config)
+# ---------------------------------------------------------------------------
+
+
+class TestStuckJobConfigWiring:
+    """Phase 6C settings must actually reach the StuckJobDetector."""
+
+    def test_worker_wires_settings_into_stuck_job_config(self) -> None:
+        from aegisforge.async_execution.stuck_job_detector import StuckJobConfig
+        from aegisforge.config import Settings
+        from aegisforge.worker import _build_stuck_job_config
+
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            secret_key="test-secret",
+            environment="test",
+            stuck_job_detection_enabled=False,
+            stuck_job_max_age_seconds=123.0,
+            stuck_job_max_claim_age_seconds=45.0,
+            stuck_job_max_execution_time_seconds=678.0,
+            stuck_job_max_recoveries=2,
+        )
+
+        config = _build_stuck_job_config(settings)
+
+        assert isinstance(config, StuckJobConfig)
+        assert config.enabled is False
+        assert config.max_job_age_seconds == 123.0
+        assert config.max_claim_age_seconds == 45.0
+        assert config.max_execution_time_seconds == 678.0
+        assert config.max_recoveries == 2
+
+    def test_worker_config_defaults_match_conservative_thresholds(self) -> None:
+        from aegisforge.config import Settings
+        from aegisforge.worker import _build_stuck_job_config
+
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            secret_key="test-secret",
+            environment="test",
+        )
+
+        config = _build_stuck_job_config(settings)
+
+        assert config.enabled is True
+        assert config.max_job_age_seconds == 3600.0
+        assert config.max_claim_age_seconds == 600.0
+        assert config.max_execution_time_seconds == 1800.0
+        assert config.max_recoveries == 5

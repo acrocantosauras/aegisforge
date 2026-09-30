@@ -461,6 +461,7 @@ class HybridRetrievalService:
         self._lexical_top_k = lexical_top_k
         self._last_query: str = ""
         self._last_org: str = ""
+        self._last_user: str = ""
         self._last_top_k: int = 5
         self._last_threshold: float = 0.0
         self._last_use_expansion: bool = False
@@ -486,6 +487,7 @@ class HybridRetrievalService:
                     RetrievalQuery(
                         query=expansion,
                         organization_id=query.organization_id,
+                        user_id=query.user_id,
                         top_k=pool,
                         similarity_threshold=query.similarity_threshold,
                         metadata_filter=query.metadata_filter,
@@ -500,6 +502,7 @@ class HybridRetrievalService:
                 top_k=self._lexical_top_k,
                 organization_id=query.organization_id,
                 metadata_filter=query.metadata_filter or None,
+                owner_id=query.user_id,
             )
             for hit in lexical_hits:
                 doc_id = hit.metadata.get("document_id", "")
@@ -544,6 +547,7 @@ class HybridRetrievalService:
         # the final optimized context without re-deriving query intent.
         self._last_query = query.query
         self._last_org = query.organization_id
+        self._last_user = query.user_id
         self._last_top_k = query.top_k
         self._last_threshold = query.similarity_threshold
         self._last_use_expansion = use_query_expansion
@@ -619,6 +623,7 @@ class RAGHybridAdapter(RetrievalService):
                 RetrievalQuery(
                     query=query_text,
                     organization_id=self._hybrid._last_org or "",
+                    user_id=self._hybrid._last_user or "",
                     top_k=self._hybrid._last_top_k,
                     similarity_threshold=self._hybrid._last_threshold,
                 ),
@@ -629,11 +634,11 @@ class RAGHybridAdapter(RetrievalService):
         assembled = self._assembler.assemble(results)
         return assembled.context_text
 
-    def get_document_count(self, organization_id: str = "") -> int:
-        return self._hybrid._semantic.get_document_count(organization_id)  # type: ignore[attr-defined]
+    def get_document_count(self, organization_id: str = "", owner_id: str = "") -> int:
+        return self._hybrid._semantic.get_document_count(organization_id, owner_id)  # type: ignore[attr-defined]
 
-    def delete_document(self, document_id: str, organization_id: str = "") -> int:
-        return self._hybrid._semantic.delete_document(document_id, organization_id)  # type: ignore[attr-defined]
+    def delete_document(self, document_id: str, organization_id: str = "", owner_id: str = "") -> int:
+        return self._hybrid._semantic.delete_document(document_id, organization_id, owner_id)  # type: ignore[attr-defined]
 
 
 def build_hybrid_retrieval_adapter(

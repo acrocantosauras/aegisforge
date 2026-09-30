@@ -276,7 +276,9 @@ def test_in_memory_vector_store_count() -> None:
         ],
         organization_id="org-1",
     )
-    assert store.count() == 2
+    # Fail-closed scoping: an unscoped count must NOT see another org's rows
+    # (previously count() with no organization_id returned every tenant's data).
+    assert store.count() == 0
     assert store.count("org-1") == 2
     assert store.count("org-2") == 0
 
@@ -402,7 +404,9 @@ def test_rag_agent_with_retrieval() -> None:
         VectorStoreEntry(id=f"c{i}", content=t, embedding=v, metadata={"source": f"doc-{i}", "document_id": f"doc-{i}"})
         for i, (t, v) in enumerate(zip(texts, vectors))
     ]
-    store.add(entries, organization_id="org-rag-test")
+    # Owner-scoped seed (P0 fix): RAGAgent retrieval is now org AND owner
+    # scoped, so the seed must carry the querying user's id.
+    store.add(entries, organization_id="org-rag-test", owner_id="user-rag-test")
 
     retrieval_service = RetrievalService(embedding_provider=provider, vector_store=store)
     agent = RAGAgent(retrieval_service=retrieval_service)
@@ -459,6 +463,7 @@ def test_rag_agent_citations_present() -> None:
     store.add(
         [VectorStoreEntry(id="c1", content="Policy guideline text", embedding=vec, metadata={"source": "policy-doc", "document_id": "doc-1"})],
         organization_id="org-rag-test",
+        owner_id="user-rag-test",
     )
 
     retrieval_service = RetrievalService(embedding_provider=provider, vector_store=store)

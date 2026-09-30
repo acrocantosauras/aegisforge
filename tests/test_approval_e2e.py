@@ -145,8 +145,21 @@ class TestApprovalE2E:
     def test_unauthorized_user_cannot_approve(self):
         client, settings = _make_app()
         token = _register(client, settings, "admin@test.com", "Admin", role="manager")
-        # Regular user from a DIFFERENT org
-        other_token = _register(client, settings, "other@test.com", "Other")
+        # Genuinely different-org user WITH manager role: tenant isolation must
+        # answer 404 before any role consideration (no existence oracle).
+        other_token = _register(client, settings, "other@test.com", "Other", role="manager")
+
+        from aegisforge.db.models import UserModel
+        from aegisforge.db.session import get_session_factory
+
+        db = get_session_factory(settings)()
+        try:
+            other = db.query(UserModel).filter(UserModel.email == "other@test.com").first()
+            assert other is not None
+            other.organization_id = "other-org"
+            db.commit()
+        finally:
+            db.close()
 
         request_id, _ = _create_and_execute(client, token, "Restart the production service")
         approvals = client.get("/api/v1/approvals", headers={"Authorization": f"Bearer {token}"}).json()
@@ -154,15 +167,16 @@ class TestApprovalE2E:
             a for a in approvals["approvals"] if a["request_id"] == request_id
         )
 
-        # Cross-tenant user: forbidden
+        # Cross-tenant user: hidden as not-found (404, never 403 — no oracle)
         resp = client.post(
             f"/api/v1/approvals/{approval['approval_id']}/approve",
             json={"decision_reason": "sneaky"},
             headers={"Authorization": f"Bearer {other_token}"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
-        # Same-org but insufficient role: forbidden
+        # Same-org but insufficient role: forbidden (403 — resource exists
+        # within the caller's own tenant, so no cross-tenant leak)
         client2, settings2 = _make_app()
         token2 = _register(client2, settings2, "user@test.com", "User", role="user")
         headers2 = {"Authorization": f"Bearer {token2}"}

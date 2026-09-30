@@ -10,7 +10,10 @@ Behavior:
 - Redis failure in production logs CRITICAL and fails open (allows the
   request) so a rate-limiter outage never becomes an availability outage.
   This is documented; a stricter policy can be configured at the proxy.
-- In-memory fallback is used only in non-production environments.
+- If Redis is unreachable at connect time, a bounded in-memory fallback
+  keeps limits enforced (per process) — Redis trouble never silently
+  becomes an unlimited-request path.  Only a runtime Redis error (connected
+  then failing) fails open, loudly.
 """
 from __future__ import annotations
 

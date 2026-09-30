@@ -13,8 +13,15 @@ from aegisforge.domain.models import (
     ExecutionPlanTask,
     TaskFailurePolicy,
 )
+from aegisforge.tools.health import select_tool_with_circuit
 
 logger = logging.getLogger(__name__)
+
+# Default capability used for research tasks.  Health-aware selection may
+# replace it with an equivalent, healthier registered tool — never with a
+# tool outside the operator-controlled registry/permission model.
+DEFAULT_RESEARCH_TOOL = "knowledge.search"
+REQUIRED_RESEARCH_PERMISSIONS = ["knowledge.search"]
 
 
 class PlannerAgent(BaseAgent):
@@ -51,7 +58,7 @@ class PlannerAgent(BaseAgent):
                 errors=["Intent is required for plan generation"],
             )
 
-        plan = self._generate_plan(intent, context)
+        plan = self._generate_plan(intent, context, input_data)
 
         if plan is None:
             return AgentResult(
@@ -76,21 +83,32 @@ class PlannerAgent(BaseAgent):
         )
 
     def _generate_plan(
-        self, intent: str, context: AgentExecutionContext
+        self,
+        intent: str,
+        context: AgentExecutionContext,
+        input_data: dict[str, Any] | None = None,
     ) -> ExecutionPlan | None:
         """Generate a structured plan from the intent.
 
         This uses deterministic rule-based planning.  A future version
         may use an LLM for more flexible decomposition, but the output
         will always be validated against the ExecutionPlan schema.
+
+        Phase 6F: when *input_data* carries bounded tool-health evidence
+        (``tool_health`` snapshots + ``available_tools`` candidates), the
+        research tool is selected health-first.  Absence of evidence keeps
+        the default tool — planning never depends on health data existing.
         """
         plan_id = f"plan-{uuid.uuid4().hex[:12]}"
         intent_lower = intent.lower()
         risk_level = _classify_risk(intent_lower)
+        research_tool = self._select_research_tool(input_data or {})
 
         # Phase 5: compound intents decompose into real multi-agent graphs
         # (parallel retrieval/research → analysis → synthesis).
-        multi_agent_plan = _generate_multi_agent_plan(plan_id, intent, intent_lower, risk_level)
+        multi_agent_plan = _generate_multi_agent_plan(
+            plan_id, intent, intent_lower, risk_level, research_tool
+        )
         if multi_agent_plan is not None:
             multi_agent_plan.request_id = context.request_id
             return multi_agent_plan
@@ -110,10 +128,10 @@ class PlannerAgent(BaseAgent):
                     task_id=task_id,
                     description=f"Research and investigate: {intent}",
                     assigned_agent_type=AgentType.RESEARCH,
-                    input_data={"query": intent, "tool_name": "knowledge.search"},
+                    input_data={"query": intent, "tool_name": research_tool},
                     dependencies=[],
                     expected_output_description="Structured research result with evidence and sources",
-                    tool_permissions_required=["knowledge.search"],
+                    tool_permissions_required=list(REQUIRED_RESEARCH_PERMISSIONS),
                     risk_level=risk_level,
                 )
             )
@@ -129,7 +147,7 @@ class PlannerAgent(BaseAgent):
                     input_data={"query": intent},
                     dependencies=[],
                     expected_output_description="Investigation result",
-                    tool_permissions_required=["knowledge.search"],
+                    tool_permissions_required=list(REQUIRED_RESEARCH_PERMISSIONS),
                     risk_level=risk_level,
                 )
             )
@@ -140,12 +158,45 @@ class PlannerAgent(BaseAgent):
             tasks=tasks,
         )
 
+    def _select_research_tool(self, input_data: dict[str, Any]) -> str:
+        """Health- and circuit-aware selection of the tool for research tasks.
+
+        Phase 6G: ``input_data`` may now also carry bounded circuit states
+        (``circuit_states``: {tool_name: closed|open|half_open}).  OPEN
+        circuits are avoided exactly like unavailable health: a strictly
+        better permission-compatible alternative wins; otherwise the
+        requested tool is kept and normal execution/retry semantics remain
+        authoritative.  Circuit state can never bypass permissions — the
+        permission check inside ``select_tool_with_circuit`` runs first.
+
+        Uses only the bounded planner input: the planner can never write
+        health or circuit state and never sees raw errors.
+        """
+        health = input_data.get("tool_health") or []
+        available = input_data.get("available_tools") or []
+        if not health or not available:
+            return DEFAULT_RESEARCH_TOOL
+        circuit_states = input_data.get("circuit_states") or {}
+        try:
+            return select_tool_with_circuit(
+                requested=DEFAULT_RESEARCH_TOOL,
+                required_permissions=list(REQUIRED_RESEARCH_PERMISSIONS),
+                available_tools=list(available),
+                health_context=health,
+                circuit_context=circuit_states,
+                permission_checker=None,
+            )
+        except Exception:  # planning must never fail on health data
+            logger.warning("Tool-health-aware selection failed; using default tool", exc_info=True)
+            return DEFAULT_RESEARCH_TOOL
+
 
 def _generate_multi_agent_plan(
     plan_id: str,
     intent: str,
     intent_lower: str,
     risk_level: str,
+    research_tool: str = DEFAULT_RESEARCH_TOOL,
 ) -> ExecutionPlan | None:
     """Deterministic multi-agent decomposition for compound intents.
 
@@ -170,7 +221,7 @@ def _generate_multi_agent_plan(
                 task_id=task_ids[0],
                 description=f"Gather internal knowledge on: {intent}",
                 assigned_agent_type=AgentType.RESEARCH,
-                input_data={"query": intent, "tool_name": "knowledge.search"},
+                input_data={"query": intent, "tool_name": research_tool},
                 dependencies=[],
                 expected_output_description="Curated internal knowledge with sources",
                 tool_permissions_required=["knowledge.search"],
@@ -221,7 +272,7 @@ def _generate_multi_agent_plan(
                 task_id=task_ids[0],
                 description=f"Research first perspective on: {intent}",
                 assigned_agent_type=AgentType.RESEARCH,
-                input_data={"query": intent, "tool_name": "knowledge.search"},
+                input_data={"query": intent, "tool_name": research_tool},
                 dependencies=[],
                 expected_output_description="Research on the first perspective",
                 tool_permissions_required=["knowledge.search"],
@@ -231,7 +282,7 @@ def _generate_multi_agent_plan(
                 task_id=task_ids[1],
                 description=f"Research second perspective on: {intent}",
                 assigned_agent_type=AgentType.RESEARCH,
-                input_data={"query": intent, "tool_name": "knowledge.search"},
+                input_data={"query": intent, "tool_name": research_tool},
                 dependencies=[],
                 expected_output_description="Research on the second perspective",
                 tool_permissions_required=["knowledge.search"],
@@ -272,7 +323,7 @@ def _generate_multi_agent_plan(
                 task_id=task_ids[0],
                 description=f"Gather knowledge for analysis: {intent}",
                 assigned_agent_type=AgentType.RESEARCH,
-                input_data={"query": intent, "tool_name": "knowledge.search"},
+                input_data={"query": intent, "tool_name": research_tool},
                 dependencies=[],
                 expected_output_description="Knowledge source for the analysis",
                 tool_permissions_required=["knowledge.search"],

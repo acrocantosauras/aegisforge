@@ -369,6 +369,12 @@ class DocumentIngestionRequest(BaseModel):
 class RetrievalQuery(BaseModel):
     query: str
     organization_id: str
+    # Owner scope (P0 fix): retrieval is owner-scoped in addition to org-
+    # scoped, mirroring REST authorization (GET /documents/{id}).  Within a
+    # shared organization, one user must never retrieve another user's
+    # private document content.  Fail-closed: empty matches owner-less rows
+    # only, so an omitted scope can never widen visibility.
+    user_id: str = ""
     top_k: int = 5
     similarity_threshold: float = 0.5
     metadata_filter: dict[str, Any] = Field(default_factory=dict)
@@ -422,7 +428,7 @@ class ExecutionJob(BaseModel):
     trace_id: str = ""
     resume: bool = False
     approval_decision: str = ""
-    submitted_at: float = 0.0  # time.monotonic() at submission for queue-wait tracking
+    submitted_at: float = 0.0  # time.time() at submission (wall clock, cross-process comparable)
 
 
 class ApprovalRequest(BaseModel):

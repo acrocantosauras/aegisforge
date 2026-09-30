@@ -47,6 +47,7 @@ To reproduce:
 """
 from __future__ import annotations
 
+import os
 import statistics
 import time
 from typing import Any
@@ -62,11 +63,17 @@ from aegisforge.async_execution.jobs import (
 from aegisforge.domain.models import ExecutionJob
 
 
+def _test_redis_url() -> str:
+    """Redis URL for tests (honors AEGISFORGE_TEST_REDIS_URL for authed Redis)."""
+    return os.environ.get(
+        "AEGISFORGE_TEST_REDIS_URL", "redis://localhost:6379/0"
+    )
+
 def _redis_available() -> bool:
     try:
         import redis as _redis
 
-        c = _redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        c = _redis.from_url(_test_redis_url(), decode_responses=True)
         c.ping()
         c.close()
         return True
@@ -87,7 +94,7 @@ def redis_client() -> Any:
     import redis
 
     client = redis.from_url(
-        "redis://localhost:6379/0",
+        _test_redis_url(),
         decode_responses=True,
     )
     client.ping()
@@ -352,3 +359,169 @@ class TestInMemoryVsRedis:
 
         print(f"\n  In-memory throughput: {throughput:.0f} jobs/sec")
         assert throughput > 100
+
+
+@requires_redis
+class TestPhase6GPerformance:
+    """Phase 6G additions: atomic claim, heartbeat, checkpoint I/O, and
+    circuit-breaker admission overhead.  Same methodology constraints as
+    the 6C baseline above: localhost Redis/SQLite, deterministic handlers,
+    single process.  NOT production-representative numbers."""
+
+    def test_atomic_claim_throughput_and_latency(self, redis_client: Any) -> None:
+        """Measure the atomic pop+claim Lua path (Phase 6G)."""
+        import uuid
+
+        queue = RedisJobQueue(
+            redis_client,
+            queue_name=f"aegisforge:test-perf-atomic-{uuid.uuid4().hex[:8]}",
+        )
+        manager = JobManager(queue)
+        num_jobs = 300
+        for i in range(num_jobs):
+            manager.submit_job(
+                request_id=f"req-{i}", workflow_id=f"wf-{i}",
+                organization_id="org-perf", idempotency_key="",
+            )
+
+        latencies: list[float] = []
+        start = time.perf_counter()
+        claimed = 0
+        for _ in range(num_jobs):
+            t0 = time.perf_counter()
+            job = queue.dequeue("w-perf", capacity=1000)
+            latencies.append(time.perf_counter() - t0)
+            if job is not None:
+                claimed += 1
+        elapsed = time.perf_counter() - start
+
+        avg_ms = statistics.mean(latencies) * 1000
+        p95_ms = statistics.quantiles(latencies, n=20)[18] * 1000
+        print(
+            f"\n  Atomic claim: {claimed/elapsed:.0f} claims/sec, "
+            f"avg {avg_ms:.2f} ms, p95 {p95_ms:.2f} ms"
+        )
+        assert claimed == num_jobs
+        assert avg_ms < 50
+
+        for key in redis_client.scan_iter(match="aegisforge:test-perf-atomic-*"):
+            redis_client.delete(key)
+
+    def test_heartbeat_latency(self, redis_client: Any) -> None:
+        """Measure Lua compare-and-expire heartbeat cost."""
+        import uuid
+
+        queue = RedisJobQueue(
+            redis_client,
+            queue_name=f"aegisforge:test-perf-hb-{uuid.uuid4().hex[:8]}",
+        )
+        manager = JobManager(queue)
+        job = manager.submit_job(
+            request_id="req-hb", workflow_id="wf-hb", organization_id="org-perf"
+        )
+        dequeued = queue.dequeue("w-hb", capacity=10)
+        assert dequeued is not None
+
+        latencies: list[float] = []
+        for _ in range(200):
+            t0 = time.perf_counter()
+            assert queue.heartbeat_job(job.job_id, "w-hb") is True
+            latencies.append(time.perf_counter() - t0)
+        avg_ms = statistics.mean(latencies) * 1000
+        print(f"\n  Heartbeat: avg {avg_ms:.2f} ms")
+        assert avg_ms < 20
+
+    def test_checkpoint_save_load_latency(self) -> None:
+        """Checkpoint write/read cost against SQLite (proxy for the pgvector
+        store; real PostgreSQL will differ)."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from aegisforge.db.base import Base
+        from aegisforge.workflows.checkpoint import (
+            DbCheckpointStore,
+            WorkflowCheckpoint,
+        )
+
+        engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(bind=engine)
+        store = DbCheckpointStore(session_factory=sessionmaker(bind=engine))
+        state = {"tasks": [{"id": i, "status": "ok"} for i in range(20)]}
+
+        save_latencies: list[float] = []
+        for i in range(50):
+            cp = WorkflowCheckpoint(
+                checkpoint_id=f"cp-{i}", workflow_id="wf-perf", request_id="req-perf",
+                node_name=f"node-{i}", organization_id="org-perf", state=state,
+            )
+            t0 = time.perf_counter()
+            store.save_checkpoint(cp)
+            save_latencies.append(time.perf_counter() - t0)
+
+        load_latencies: list[float] = []
+        for i in range(50):
+            t0 = time.perf_counter()
+            loaded = store.load_checkpoint(f"cp-{i}")
+            load_latencies.append(time.perf_counter() - t0)
+            assert loaded is not None
+
+        save_avg = statistics.mean(save_latencies) * 1000
+        load_avg = statistics.mean(load_latencies) * 1000
+        print(f"\n  Checkpoint save: avg {save_avg:.2f} ms; load: avg {load_avg:.2f} ms")
+        assert save_avg < 50
+        assert load_avg < 50
+
+    def test_circuit_admission_overhead(self) -> None:
+        """Circuit CLOSED admission overhead vs OPEN fast-fail."""
+        from aegisforge.tools.base import BaseTool, ToolDefinition
+        from aegisforge.tools.circuit_breaker import (
+            CircuitBreakerConfig,
+            ToolCircuitBreaker,
+        )
+        from aegisforge.tools.health import ToolHealthTracker
+        from aegisforge.tools.registry import ToolRegistry
+
+        class NoopTool(BaseTool):
+            def __init__(self) -> None:
+                super().__init__(
+                    ToolDefinition(name="perf.noop", description="d", permission_requirements=["p"])
+                )
+
+            def _execute(self, input_data: dict[str, Any], context: Any = None) -> dict[str, Any]:
+                return {}
+
+        registry = ToolRegistry(
+            health_tracker=ToolHealthTracker(),
+            circuit_breaker=ToolCircuitBreaker(
+                CircuitBreakerConfig(failure_threshold=5, cooldown_seconds=3600)
+            ),
+        )
+        registry.register(NoopTool())
+
+        closed_times: list[float] = []
+        for _ in range(300):
+            t0 = time.perf_counter()
+            r = registry.execute("perf.noop", {}, granted_permissions=["p"])
+            closed_times.append(time.perf_counter() - t0)
+            assert r.status.value == "completed"
+
+        # Trip the circuit.
+        for _ in range(5):
+            registry._circuit.record_failure("perf.noop")
+        assert registry.get_circuit_state("perf.noop") == "open"
+
+        open_times: list[float] = []
+        for _ in range(300):
+            t0 = time.perf_counter()
+            r = registry.execute("perf.noop", {}, granted_permissions=["p"])
+            open_times.append(time.perf_counter() - t0)
+            assert "circuit" in (r.error or "").lower()
+
+        closed_avg_us = statistics.mean(closed_times) * 1e6
+        open_avg_us = statistics.mean(open_times) * 1e6
+        print(
+            f"\n  Circuit CLOSED admission: {closed_avg_us:.0f} µs/call; "
+            f"OPEN fast-fail: {open_avg_us:.0f} µs/call"
+        )
+        # Fast-fail must be cheaper than a real execution (tool skipped).
+        assert open_avg_us < closed_avg_us * 5

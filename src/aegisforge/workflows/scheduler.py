@@ -16,6 +16,7 @@ unbounded worker threads: concurrency is capped by ``ExecutionConfig``.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -45,6 +46,8 @@ from aegisforge.observability.metrics import (
     record_task_concurrency,
     record_task_execution,
     record_task_retry,
+    record_workflow_task_checkpoint,
+    record_workflow_tasks_skipped_on_resume,
 )
 from aegisforge.tools.knowledge_tool import KnowledgeSearchTool
 from aegisforge.tools.registry import ToolRegistry
@@ -434,6 +437,15 @@ class MultiAgentExecutor:
         wave_count = 0
         max_in_flight = 0
 
+        # Phase 6E: count tasks restored from a durable checkpoint that will
+        # not be re-executed (at-least-once resume observability).
+        for tid, rec in records.items():
+            if rec.status != AgentExecutionStatus.PENDING:
+                try:
+                    record_workflow_tasks_skipped_on_resume(rec.status.value)
+                except Exception:  # noqa: S110 - observability must never break execution
+                    pass
+
         # Seed records for tasks that have not run yet.
         for task in plan.tasks:
             if task.task_id not in records:
@@ -531,6 +543,7 @@ class MultiAgentExecutor:
                     plan, executable, records,
                     request_id=request_id, workflow_id=workflow_id,
                     organization_id=organization_id, user_id=user_id, intent=intent,
+                    errors=errors,
                 )
                 max_in_flight = max(max_in_flight, in_flight)
 
@@ -675,10 +688,13 @@ class MultiAgentExecutor:
         organization_id: str,
         user_id: str,
         intent: str,
+        errors: list[str] | None = None,
     ) -> int:
         """Run a set of ready tasks with bounded concurrency."""
         if not tasks:
             return 0
+        if errors is None:
+            errors = []
         concurrency = max(1, min(self._config.max_concurrency, len(tasks)))
         if self._agent_factory is None:
             self._agent_factory = AgentFactory()
@@ -689,6 +705,29 @@ class MultiAgentExecutor:
 
         futures: dict[Any, ExecutionPlanTask] = {}
         pool = ThreadPoolExecutor(max_workers=concurrency)
+
+        # Phase 6E: task-level durable checkpointing.  A wave-boundary-only
+        # checkpoint loses intra-wave completions when the worker crashes (or
+        # when one long-running task holds the wave open).  Each task's done
+        # callback emits a checkpoint the moment that task reaches a terminal
+        # state, so recovered workflows resume from the last completed TASK,
+        # not the last completed WAVE.
+        done_tasks: set[str] = set()
+        done_lock = threading.Lock()
+
+        def _on_task_terminal(future: Any) -> None:
+            try:
+                task = futures.get(future)
+                with done_lock:
+                    if task is not None:
+                        done_tasks.add(task.task_id)
+                self._save_task_checkpoint(
+                    plan, records, errors, done_tasks, done_lock, futures,
+                    completed_task_id=task.task_id if task is not None else None,
+                )
+            except Exception:  # noqa: S110 — checkpointing must never break the run
+                pass
+
         try:
             for task in tasks:
                 if records[task.task_id].status != AgentExecutionStatus.PENDING:
@@ -704,7 +743,10 @@ class MultiAgentExecutor:
                     user_id=user_id,
                     intent=intent,
                 )
+                # Register the mapping BEFORE attaching the callback so the
+                # callback can always resolve which task completed.
                 futures[future] = task
+                future.add_done_callback(_on_task_terminal)
 
             for future, task in futures.items():
                 total_budget = task.timeout_seconds * (task.max_retries + 1)
@@ -730,10 +772,27 @@ class MultiAgentExecutor:
         return concurrency
 
     def _classify_failure(self, errors: list[str], status: Any) -> str:
-        """Classify a failure type for recovery decisions (Phase 5.3E).
+        """Classify a failure type for recovery decisions (Phase 5.3E, extended 6G).
 
-        Returns one of: "transient", "configuration", "dependency",
-        "permission", "timeout", "unknown".
+        Bounded taxonomy — returns exactly one of:
+
+        - ``timeout``        — the task/tool exceeded its time budget.
+        - ``transient``      — connection/transport/temporary downstream
+          failures; safe to retry (retry with backoff is meaningful).
+        - ``unavailable``    — tool/service explicitly unavailable, including
+          circuit-open fast-fails (CIRCUIT_OPEN) and "tool not connected".
+        - ``model``          — LLM provider failures (rate limit, bad output,
+          provider outage).
+        - ``permission``     — DENIED by policy. NEVER retried automatically;
+          requires human/policy action.
+        - ``configuration``  — missing configuration/registration. Deterministic
+          failure; retrying without configuration change cannot succeed.
+        - ``dependency``     — a required upstream dependency failed.
+        - ``unknown``        — unclassified. Retried cautiously within bounds.
+
+        "CIRCUIT_OPEN" (from the tool circuit breaker) is classified as
+        ``unavailable`` — a recovery decision may retry or pick an alternate
+        tool, but the circuit itself enforces bounded probing.
         """
         error_text = ";".join(errors).lower() if errors else ""
         status_val = status.value if hasattr(status, "value") else str(status)
@@ -742,43 +801,58 @@ class MultiAgentExecutor:
             return "timeout"
         if status_val == "denied":
             return "permission"
-        if any(kw in error_text for kw in ["not connected", "unavailable", "refused", "connection"]):
+        if "circuit_open" in error_text:
+            return "unavailable"
+        if any(
+            kw in error_text
+            for kw in ["rate limit", "quota", "model", "llm", "completion"]
+        ):
+            return "model"
+        if any(
+            kw in error_text
+            for kw in ["not connected", "refused", "connection", "transport"]
+        ):
             return "transient"
-        if any(kw in error_text for kw in ["not configured", "not available", "not registered", "not found"]):
+        if any(kw in error_text for kw in ["unavailable", "temporarily", "circuit"]):
+            return "unavailable"
+        if any(
+            kw in error_text
+            for kw in ["not configured", "not available", "not registered", "not found"]
+        ):
             return "configuration"
         if any(kw in error_text for kw in ["dependency", "required dependency", "blocked"]):
             return "dependency"
         return "unknown"
 
     def _suggest_recovery(self, failure_type: str, retry_count: int, max_retries: int) -> dict[str, Any]:
-        """Suggest a recovery strategy based on failure classification (Phase 5.3E).
+        """Suggest a recovery strategy based on failure classification.
 
-        Returns a structured decision: action + reason.
+        Phase 6G contract (stricter than Phase 5.3E):
+
+        - Permission/policy failures are NEVER retried or auto-recovered;
+          they escalate to humans.  Retrying a deterministic policy denial
+          cannot succeed and may constitute a policy violation.
+        - Timeout, transient, and unavailable failures retry within the
+          bounded per-task retry budget.
+        - Model failures retry within bounds (provider issues are often
+          transient but can be deterministic — the bounded budget caps both).
+        - Configuration and dependency failures never retry (deterministic;
+          bounded skips avoid burning budget on impossible work).
+        - Unknown failures retry cautiously within the bounded budget only —
+          never outside it, and never for tasks whose policy forbids retry.
         """
         remaining = max_retries - retry_count
 
-        if failure_type == "transient" and remaining > 0:
+        if failure_type == "permission":
             return {
-                "action": "retry",
-                "reason": f"Transient failure with {remaining} retries remaining",
-                "recoverable": True,
-            }
-        if failure_type == "timeout" and remaining > 0:
-            return {
-                "action": "retry_with_extended_timeout",
-                "reason": f"Timeout with {remaining} retries remaining",
-                "recoverable": True,
+                "action": "escalate",
+                "reason": "Permission denied — requires policy review; automatic retry is forbidden",
+                "recoverable": False,
             }
         if failure_type == "configuration":
             return {
                 "action": "skip",
-                "reason": "Configuration error — tool/agent not available",
-                "recoverable": False,
-            }
-        if failure_type == "permission":
-            return {
-                "action": "escalate",
-                "reason": "Permission denied — requires policy review",
+                "reason": "Configuration error — tool/agent not available; retrying cannot succeed without configuration change",
                 "recoverable": False,
             }
         if failure_type == "dependency":
@@ -786,6 +860,30 @@ class MultiAgentExecutor:
                 "action": "skip",
                 "reason": "Required dependency failed",
                 "recoverable": False,
+            }
+        if failure_type == "timeout" and remaining > 0:
+            return {
+                "action": "retry_with_extended_timeout",
+                "reason": f"Timeout with {remaining} retries remaining",
+                "recoverable": True,
+            }
+        if failure_type == "transient" and remaining > 0:
+            return {
+                "action": "retry",
+                "reason": f"Transient failure with {remaining} retries remaining",
+                "recoverable": True,
+            }
+        if failure_type == "unavailable" and remaining > 0:
+            return {
+                "action": "retry",
+                "reason": f"Tool/service unavailable (possibly circuit-open) with {remaining} retries remaining",
+                "recoverable": True,
+            }
+        if failure_type == "model" and remaining > 0:
+            return {
+                "action": "retry",
+                "reason": f"Model failure with {remaining} retries remaining",
+                "recoverable": True,
             }
         # Unknown or exhausted retries
         if remaining > 0:
@@ -877,7 +975,7 @@ class MultiAgentExecutor:
             record.status = result.status
             record.errors = list(result.errors or [f"Agent finished with status {result.status.value}"])
 
-            # Phase 5.3E: Classify failure and log recovery decision
+            # Phase 5.3E/6G: Classify failure and log recovery decision
             failure_type = self._classify_failure(record.errors, result.status)
             recovery = self._suggest_recovery(failure_type, attempt, task.max_retries)
             recovery_log.append({
@@ -887,6 +985,12 @@ class MultiAgentExecutor:
                 "recoverable": recovery["recoverable"],
                 "reason": recovery["reason"],
             })
+            try:
+                from aegisforge.observability.metrics import record_failure_classification
+
+                record_failure_classification(failure_type, recovery["action"])
+            except Exception:  # noqa: S110 - observability must never break execution
+                pass
             logger.info(
                 "Task %s attempt %d/%d: failure_type=%s, recovery=%s",
                 task.task_id, attempt + 1, attempts,
@@ -995,6 +1099,83 @@ class MultiAgentExecutor:
             )
         except Exception as exc:  # checkpointing must never break the run
             logger.warning("Checkpoint callback failed: %s", exc)
+
+    def _save_task_checkpoint(
+        self,
+        plan: ExecutionPlan,
+        records: dict[str, TaskExecutionRecord],
+        errors: list[str],
+        done_tasks: set[str],
+        done_lock: threading.Lock,
+        futures: dict[Any, ExecutionPlanTask],
+        completed_task_id: str | None = None,
+    ) -> None:
+        """Phase 6E: task-level durable checkpoint (per-task granularity).
+
+        Emitted from a worker thread the moment a task reaches a terminal
+        state, so a mid-wave crash never loses already-completed task work.
+
+        Snapshot safety: records of tasks whose futures have NOT completed
+        are captured as fresh PENDING stubs instead of live records.  A
+        mid-finalization record could otherwise be observed as COMPLETED
+        before its output fields are set, which would make a resumed run
+        skip a task whose output was never checkpointed.  Stubbing a
+        possibly-finished task as PENDING is always safe: the task is
+        re-executed (at-least-once semantics) instead of skipped.
+
+        Tasks outside the current wave (terminal records restored from a
+        previous checkpoint, gated tasks) are dumped live: only the main
+        thread ever mutates them, and it does not mutate them during a wave.
+        """
+        if self._checkpoint_callback is None:
+            return
+        from aegisforge.observability.metrics import observe_checkpoint_save
+
+        wave_task_ids = {t.task_id for t in futures.values()}
+        with done_lock:
+            done = set(done_tasks)
+
+        snapshot: dict[str, dict[str, Any]] = {}
+        for task in plan.tasks:
+            rec = records.get(task.task_id)
+            if rec is None:
+                continue
+            if task.task_id in wave_task_ids and task.task_id not in done:
+                snapshot[task.task_id] = TaskExecutionRecord(
+                    task_id=task.task_id,
+                    description=task.description,
+                    agent_type=task.assigned_agent_type.value,
+                    status=AgentExecutionStatus.PENDING,
+                    dependencies=list(task.dependencies),
+                    max_retries=task.max_retries,
+                    timeout_seconds=task.timeout_seconds,
+                    failure_policy=task.failure_policy,
+                ).model_dump(mode="json")
+            else:
+                snapshot[task.task_id] = rec.model_dump(mode="json")
+
+        save_started = time.perf_counter()
+        self._checkpoint_callback(
+            {
+                "task_records": snapshot,
+                "errors": errors,
+            }
+        )
+        try:
+            observe_checkpoint_save("task", time.perf_counter() - save_started)
+        except Exception:  # noqa: S110 — observability must never break execution
+            pass
+
+        # Bounded observability: count the terminal-state checkpoint by the
+        # status of the task that just completed (its record is guaranteed
+        # fully written — its own future resolved).
+        if completed_task_id is not None:
+            rec = records.get(completed_task_id)
+            if rec is not None and rec.status != AgentExecutionStatus.PENDING:
+                try:
+                    record_workflow_task_checkpoint(rec.status.value)
+                except Exception:  # noqa: S110 - observability must never break execution
+                    pass
 
     def _summarize(
         self,

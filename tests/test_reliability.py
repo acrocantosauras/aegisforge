@@ -16,6 +16,7 @@ Uses real Redis to prove actual distributed queue semantics.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -30,12 +31,19 @@ from aegisforge.domain.models import ExecutionJob, ExecutionJobStatus
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def _test_redis_url() -> str:
+    """Redis URL for tests (honors AEGISFORGE_TEST_REDIS_URL for authed Redis)."""
+    return os.environ.get(
+        "AEGISFORGE_TEST_REDIS_URL", "redis://localhost:6379/0"
+    )
+
 def _redis_available() -> bool:
     """Check if a real Redis instance is reachable."""
     try:
         import redis as _redis
 
-        c = _redis.from_url("redis://localhost:6379/0", decode_responses=True)
+        c = _redis.from_url(_test_redis_url(), decode_responses=True)
         c.ping()
         c.close()
         return True
@@ -55,7 +63,7 @@ def redis_client() -> Any:
     import redis
 
     client = redis.from_url(
-        "redis://localhost:6379/0",
+        _test_redis_url(),
         decode_responses=True,
     )
     client.ping()
@@ -117,12 +125,11 @@ def test_worker_crash_job_recovery(redis_client: Any, unique_queue_name: str) ->
     assert dequeued.job_id == job.job_id
 
     # Claim the job (simulating worker starting execution)
-    queue.claim_job(dequeued, "worker-crasher")
+    _claimed = queue.claim_job(dequeued, "worker-crasher")
+    assert _claimed
 
-    # Wait for claim to expire (worker crashed, no heartbeat)
-    time.sleep(3)
-
-    # Recovery scan finds the expired claim
+    # Let the visibility timeout (2s) elapse, then run a recovery scan.
+    time.sleep(2.5)
     recovered = queue.recover_expired_claims()
     assert job.job_id in recovered
 

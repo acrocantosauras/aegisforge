@@ -77,11 +77,30 @@ class TestReadinessEndpoint:
         assert "status" in resp2.json()
 
 
+def _auth_headers(client: TestClient) -> dict[str, str]:
+    client.post(
+        "/api/v1/auth/register",
+        json={"email": "workers@example.com", "password": "SecurePass123!", "full_name": "T"},
+    )
+    token = client.post(
+        "/api/v1/auth/login",
+        json={"email": "workers@example.com", "password": "SecurePass123!"},
+    ).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 class TestWorkerStatusEndpoint:
+    def test_workers_endpoint_requires_authentication(self) -> None:
+        """/workers is operational data — anonymous access is rejected."""
+        client = _make_client()
+        resp = client.get("/api/v1/workers")
+        assert resp.status_code == 401
+
     def test_workers_endpoint_returns_structure(self) -> None:
         """/workers returns a structured response."""
         client = _make_client()
-        resp = client.get("/api/v1/workers")
+        headers = _auth_headers(client)
+        resp = client.get("/api/v1/workers", headers=headers)
         data = resp.json()
         assert "status" in data
         assert "active_workers" in data
@@ -91,7 +110,8 @@ class TestWorkerStatusEndpoint:
     def test_workers_endpoint_shows_no_workers_when_redis_unavailable(self) -> None:
         """/workers handles Redis unavailability gracefully."""
         client = _make_client()
-        resp = client.get("/api/v1/workers")
+        headers = _auth_headers(client)
+        resp = client.get("/api/v1/workers", headers=headers)
         data = resp.json()
         # Should return a valid response even if Redis is down
         assert "status" in data

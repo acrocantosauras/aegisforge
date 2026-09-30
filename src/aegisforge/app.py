@@ -53,12 +53,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (token signing, rate limits, approval timeouts, etc.)
     app.dependency_overrides[_get_settings] = lambda: settings
 
-    # F11: CORS — configurable origins, no wildcard for authenticated usage
+    # F11: CORS — configurable origins, no wildcard for authenticated usage.
+    # A wildcard origin combined with allow_credentials=True is unsafe:
+    # any origin could make credentialed requests.  When an explicit
+    # wildcard is configured, credentials are force-disabled.
     cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    allow_credentials = "*" not in cors_origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_credentials=True,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

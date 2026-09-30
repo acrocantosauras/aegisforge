@@ -148,3 +148,29 @@ groups:
         annotations:
           summary: "High workflow checkpoint resume rate"
           description: "Workflows are resuming from checkpoints at >0.1/s for 10 minutes. This may indicate frequent worker crashes or a systemic issue."
+
+      # Phase 6E: high rate of completed tasks restored from checkpoints.
+      # Some resume skips are normal (crash recovery working as designed);
+      # a sustained high rate means the same work is being redone constantly.
+      - alert: HighTaskResumeSkipRate
+        expr: rate(workflow_tasks_skipped_on_resume_total{status="completed"}[10m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate of completed tasks restored from checkpoints"
+          description: "More than 0.5 completed tasks/s are being restored from durable checkpoints for 10 minutes. Workers may be crashing mid-wave repeatedly — check infrastructure stability."
+
+  - name: aegisforge-tools
+    rules:
+      # Phase 6F: sustained WIDESPREAD tool degradation. Deliberately no
+      # per-tool alerts — a single tool degrading is routine and the planner
+      # already routes around it; only broad degradation should page anyone.
+      - alert: WidespreadToolDegradation
+        expr: (tool_health_states{state="degraded"} + tool_health_states{state="unavailable"}) >= 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple tools degraded or unavailable"
+          description: "3 or more tools have been degraded/unavailable for 10 minutes. Planning is routing around them; check upstream dependencies."

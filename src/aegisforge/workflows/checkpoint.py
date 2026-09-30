@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -133,12 +135,27 @@ class DbCheckpointStore(CheckpointStore):
         Base.metadata.create_all(bind=session.get_bind())
 
     def _model_to_checkpoint(self, model: Any) -> WorkflowCheckpoint:
+        # Phase 6G: malformed state_json (corrupt row, partial write, manual
+        # tampering) must not crash resume — return an empty-state checkpoint
+        # so the workflow restarts cleanly (at-least-once) instead of raising.
+        try:
+            state = json.loads(model.state_json or "{}")
+            if not isinstance(state, dict):
+                state = {}
+        except (TypeError, ValueError):
+            logger.warning(
+                "Checkpoint %s for workflow %s has malformed state_json; "
+                "treating as empty (workflow will re-execute)",
+                model.id,
+                model.workflow_id,
+            )
+            state = {}
         return WorkflowCheckpoint(
             checkpoint_id=model.id,
             workflow_id=model.workflow_id,
             request_id=model.request_id,
             node_name=model.node_name,
-            state=json.loads(model.state_json or "{}"),
+            state=state,
             organization_id=model.organization_id,
             user_id=model.user_id,
             created_at=model.created_at,
@@ -262,6 +279,12 @@ class WorkflowCheckpointer:
         self.user_id = user_id
         self._store = store or InMemoryCheckpointStore()
         self._execution_id = f"exec-{uuid.uuid4().hex[:12]}"
+        # Phase 6E: per-task checkpoints may be emitted concurrently by
+        # scheduler worker threads.  Timestamps must strictly increase in
+        # save order, otherwise ``load_latest_by_workflow`` (which orders by
+        # created_at) could return a stale snapshot on microsecond ties.
+        self._save_lock = threading.Lock()
+        self._last_created_at: datetime | None = None
 
     @property
     def execution_id(self) -> str:
@@ -269,20 +292,39 @@ class WorkflowCheckpointer:
 
     def save_after_node(self, node_name: str, state: dict[str, Any]) -> str:
         """Save a checkpoint after a node completes. Returns the checkpoint ID."""
+        from aegisforge.observability.metrics import observe_checkpoint_save
+
         checkpoint_id = f"cp-{uuid.uuid4().hex[:12]}"
         # Sanitize state for storage — remove sensitive fields
         sanitized_state = _sanitize_state(state)
 
-        checkpoint = WorkflowCheckpoint(
-            checkpoint_id=checkpoint_id,
-            workflow_id=self.workflow_id,
-            request_id=self.request_id,
-            node_name=node_name,
-            state=sanitized_state,
-            organization_id=self.organization_id,
-            user_id=self.user_id,
-        )
-        self._store.save_checkpoint(checkpoint)
+        save_started = time.perf_counter()
+        with self._save_lock:
+            created_at = datetime.now(UTC)
+            if (
+                self._last_created_at is not None
+                and created_at <= self._last_created_at
+            ):
+                # Enforce strict monotonicity within save order.
+                created_at = self._last_created_at + timedelta(microseconds=1)
+            self._last_created_at = created_at
+
+            checkpoint = WorkflowCheckpoint(
+                checkpoint_id=checkpoint_id,
+                workflow_id=self.workflow_id,
+                request_id=self.request_id,
+                node_name=node_name,
+                state=sanitized_state,
+                organization_id=self.organization_id,
+                user_id=self.user_id,
+                created_at=created_at,
+            )
+            self._store.save_checkpoint(checkpoint)
+
+        try:
+            observe_checkpoint_save("workflow", time.perf_counter() - save_started)
+        except Exception:  # noqa: S110 — observability must never break execution
+            pass
 
         logger.info(
             "Checkpoint saved: %s (node=%s, workflow=%s, request=%s)",
@@ -294,9 +336,40 @@ class WorkflowCheckpointer:
         return checkpoint_id
 
     def load_resume_state(self) -> dict[str, Any] | None:
-        """Load the latest checkpoint state for workflow resumption."""
+        """Load the latest checkpoint state for workflow resumption.
+
+        Phase 6G: tenant guard — if the stored checkpoint was written for a
+        DIFFERENT organization than this checkpointer's, it is rejected and
+        treated as absent.  The workflow_id is the lookup key, but a
+        misconfigured/duplicated workflow id must never leak another tenant's
+        plan, task records, or results into this tenant's resume.
+        """
         checkpoint = self._store.load_latest_by_workflow(self.workflow_id)
         if checkpoint is None:
+            return None
+
+        if (
+            self.organization_id
+            and checkpoint.organization_id
+            and checkpoint.organization_id != self.organization_id
+        ):
+            logger.error(
+                "Checkpoint organization mismatch for workflow %s: checkpoint "
+                "belongs to a different organization; refusing to resume from it",
+                self.workflow_id,
+            )
+            return None
+
+        # Shape guard: graph nodes require a dict state.  A corrupt or
+        # wrongly-typed checkpoint must degrade to a fresh start (at-least-once
+        # re-execution), never crash the worker.
+        if not isinstance(checkpoint.state, dict):
+            logger.warning(
+                "Checkpoint %s for workflow %s has non-dict state; "
+                "ignoring it (workflow will re-execute)",
+                checkpoint.checkpoint_id,
+                self.workflow_id,
+            )
             return None
 
         logger.info(

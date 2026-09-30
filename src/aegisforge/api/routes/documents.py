@@ -132,11 +132,18 @@ async def upload_document(
                         "document_id": c.document_id,
                         "source": c.source,
                         "organization_id": user.organization_id,
+                        "owner_id": user.id,
                     },
                 )
                 for c, emb in zip(ingestion_result.chunks, embeddings)
             ]
-            vector_store.add(entries, organization_id=user.organization_id)
+            # Owner-scoped ingestion (P0 fix): chunks are bound to the
+            # uploading user so retrieval can enforce org AND owner scope.
+            vector_store.add(
+                entries,
+                organization_id=user.organization_id,
+                owner_id=user.id,
+            )
     except Exception as exc:
         logger.warning("Vector storage failed (non-fatal): %s", exc)
 
@@ -186,9 +193,14 @@ def list_documents(
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
 ) -> DocumentListResponse:
-    """List documents for the user's organization."""
+    """List the caller's documents (org + owner scoped).
+
+    SECURITY: org-only listing would expose every user's document titles and
+    sources to the shared default organization.  Users see their own uploads.
+    """
     query = db.query(DocumentModel).filter(
-        DocumentModel.organization_id == user.organization_id
+        DocumentModel.organization_id == user.organization_id,
+        DocumentModel.uploaded_by == user.id,
     )
     total = query.count()
     documents = (
@@ -211,12 +223,12 @@ def get_document(
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
 ) -> DocumentModel:
-    """Get document details with tenant isolation."""
+    """Get document details (org + owner scoped; 404 — no existence oracle)."""
     doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    if doc.organization_id != user.organization_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if doc.organization_id != user.organization_id or doc.uploaded_by != user.id:
+        raise HTTPException(status_code=404, detail="Document not found")
     return doc
 
 
@@ -227,26 +239,33 @@ def delete_document(
     user: UserModel = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ) -> None:
-    """Delete a document and its chunks with tenant isolation."""
+    """Delete a document and its chunks (org + owner scoped)."""
     doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    if doc.organization_id != user.organization_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if doc.organization_id != user.organization_id or doc.uploaded_by != user.id:
+        # Same-org users must not be able to delete each other's documents.
+        raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete chunks
+    # Delete chunks (org-scoped for defense in depth; ownership is already
+    # proven via the parent document row above)
     db.query(DocumentChunkModel).filter(
-        DocumentChunkModel.document_id == document_id
+        DocumentChunkModel.document_id == document_id,
+        DocumentChunkModel.organization_id == user.organization_id,
     ).delete()
 
-    # Delete from vector store
+    # Delete from vector store (org + owner scoped — same authorization
+    # predicate as retrieval, so a delete can never touch another user's
+    # chunks even if document metadata rows were manipulated).
     try:
         vector_store = get_vector_store(
             "pgvector" if settings.database_url.startswith("postgresql") else "memory",
             db_session_factory=lambda: get_session_factory(settings)(),
             dimension=settings.embedding_dimension,
         )
-        vector_store.delete_by_document(document_id, user.organization_id)
+        vector_store.delete_by_document(
+            document_id, user.organization_id, owner_id=user.id
+        )
     except Exception as exc:
         logger.warning("Failed to delete from vector store: %s", exc)
 

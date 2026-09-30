@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextvars import ContextVar
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -29,6 +30,10 @@ from aegisforge.observability.metrics import (
 )
 from aegisforge.observability.tracing import Tracer
 from aegisforge.rag.retrieval import RetrievalService
+from aegisforge.tools.health import (
+    build_planner_health_context,
+    get_default_tool_health_tracker,
+)
 from aegisforge.tools.knowledge_tool import KnowledgeSearchTool
 from aegisforge.tools.registry import ToolRegistry
 from aegisforge.workflows.checkpoint import (
@@ -49,6 +54,122 @@ _APPROVAL_REQUIRED_LEVELS = {"high", "critical"}
 
 # Maximum evaluation/retry loops to prevent infinite cycles
 _MAX_EVALUATION_LOOPS = 10
+
+# Ordering of risk levels (server-side escalation checks)
+_RISK_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+
+def _task_effective_risk(task: dict[str, Any], registry: ToolRegistry | None) -> str:
+    """Highest of the task's declared risk and its tool's server-side risk.
+
+    Mirrors ``MultiAgentExecutor._effective_risk``: a planner (or a tampered
+    checkpoint) can understate ``risk_level``, but the operator-controlled
+    registry definition always wins, so a downgrade in the plan cannot skip
+    the approval gate.
+    """
+    declared = task.get("risk_level", "low")
+    risk = (declared.value if hasattr(declared, "value") else str(declared)).lower()
+    if registry is None:
+        return risk
+    tool_name = str((task.get("input_data") or {}).get("tool_name", ""))
+    if not tool_name:
+        return risk
+    tool = registry.get(tool_name)
+    if tool is None:
+        return risk
+    tool_risk = str(tool.definition.risk_level).lower()
+    if _RISK_RANK.get(tool_risk, 0) > _RISK_RANK.get(risk, 0):
+        return tool_risk
+    return risk
+
+
+def _legacy_approval_gate(
+    state: dict[str, Any],
+    task: dict[str, Any],
+    registry: ToolRegistry | None,
+) -> dict[str, Any] | None:
+    """Pause BEFORE executing a high-risk task in the serial (legacy) path.
+
+    Returns the paused workflow state, or ``None`` when the task may run.
+
+    WS6: the serial path used to gate approvals in ``retry_or_complete``
+    AFTER the task had already executed — the approval could not stop an
+    action that already happened.  The gate now runs pre-execution and
+    fails CLOSED: if a required approval cannot be persisted, the workflow
+    fails instead of running the protected action.
+    """
+    approval_service = _current_context().approval_service
+    if approval_service is None:
+        # No approval service configured — identical to the multi-agent
+        # executor, which only gates when a service exists.
+        return None
+
+    task_id = str(task.get("task_id", ""))
+    approved = set(state.get("approved_task_ids", []) or [])
+    if task_id and task_id in approved:
+        # Granted via approval resume — this task may run.
+        return None
+
+    risk = _task_effective_risk(task, registry)
+    if risk not in _APPROVAL_REQUIRED_LEVELS:
+        return None
+
+    # Reuse a pending approval already created for THIS task; never adopt
+    # one that belongs to a different task.
+    approval_id = str(state.get("approval_id", ""))
+    approval_task_id = str(state.get("approval_task_id", ""))
+    if approval_id and approval_task_id not in ("", task_id):
+        approval_id = ""
+
+    if not approval_id:
+        try:
+            from aegisforge.domain.models import RiskLevel
+
+            approval = approval_service.create_approval_request(
+                job_id=state.get("job_id", "") or state.get("plan", {}).get("plan_id", ""),
+                request_id=state.get("request_id", ""),
+                workflow_id=state.get("workflow_id", ""),
+                action_description=task.get("action_description")
+                or task.get("description", "Task execution"),
+                requested_by=state.get("user_id", "") or "system",
+                organization_id=state.get("organization_id", ""),
+                risk_level=RiskLevel(risk),
+                reason=task.get("description", ""),
+            )
+            approval_id = approval.approval_id
+        except Exception as exc:
+            # Fail closed: approval required but not persisted → never run.
+            logger.exception(
+                "Could not create approval for high-risk task %s — failing workflow",
+                task_id,
+            )
+            failure_message = (
+                f"Approval required for high-risk task {task_id} "
+                f"but could not be created: {exc}"
+            )
+            return _copy_state(
+                state,
+                status=RequestStatus.FAILED.value,
+                errors=list(state.get("errors", [])) + [failure_message],
+            )
+
+    logger.info(
+        "Workflow %s paused BEFORE executing high-risk task %s (risk=%s, approval=%s)",
+        state.get("workflow_id", "unknown"),
+        task_id,
+        risk,
+        approval_id,
+    )
+    return _copy_state(
+        state,
+        status=RequestStatus.ACTION_REQUIRES_APPROVAL.value,
+        approval_required=True,
+        approval_risk_level=risk,
+        approval_action=task.get("action_description") or task.get("description", "Task execution"),
+        approval_id=approval_id,
+        approval_task_id=task_id,
+        current_task=task,
+    )
 
 
 # --- Dependency injection via module-level context ---
@@ -85,6 +206,26 @@ class _WorkflowContext:
 
 _ctx = _WorkflowContext()
 
+# Phase 6G: per-execution workflow context override.
+#
+# The module-level ``_ctx`` singleton is shared mutable state: two
+# concurrent synchronous workflow executions in the same process (e.g. the
+# FastAPI threadpool running two requests) would clobber each other's
+# checkpointer/model provider/MCP lifecycle, causing checkpoints and
+# approvals to leak across workflows.  ``execute_workflow`` now publishes a
+# ContextVar-scoped context for the duration of the run; graph nodes resolve
+# dependencies from it first and fall back to ``_ctx`` only when unset
+# (which preserves direct node-call usage in tests and external callers).
+_execution_ctx: ContextVar[_WorkflowContext | None] = ContextVar(
+    "aegisforge_execution_ctx", default=None
+)
+
+
+def _current_context() -> _WorkflowContext:
+    """Resolve the active workflow context (execution-scoped, then global)."""
+    override = _execution_ctx.get()
+    return override if override is not None else _ctx
+
 
 def _build_registry() -> ToolRegistry:
     """Create and populate the tool registry for this workflow."""
@@ -95,6 +236,64 @@ def _build_registry() -> ToolRegistry:
 
     registry, _ctx.mcp_lifecycle = configure_mcp_registry(get_settings(), registry)
     return registry
+
+
+def _build_planner_input(state: dict[str, Any]) -> dict[str, Any]:
+    """Build the bounded planner input, including tool-health context (6F/6G).
+
+    Side-effect free: health evidence is read from the process-wide tracker
+    (fed by real executions); candidate alternatives come from a lightweight
+    built-ins-only registry so planning never connects MCP servers.  MCP tool
+    health still reaches the LLM planner via the rendered context block.
+
+    Phase 6G: bounded circuit states are included so the deterministic
+    planner avoids OPEN circuits the same way it avoids unavailable tools.
+    Circuit data is read-only state (closed/open/half_open) — no errors, no
+    payloads, identical for all tenants.
+    """
+    planner_input: dict[str, Any] = {"intent": state.get("intent", "")}
+    try:
+        snapshots = get_default_tool_health_tracker().list_health()
+        planner_input["tool_health"] = [s.to_dict() for s in snapshots]
+        planner_input["tool_health_context"] = build_planner_health_context(snapshots)
+        # Phase 6G: bounded circuit-state context for planner selection.
+        try:
+            from aegisforge.tools.circuit_breaker import get_default_circuit_breaker
+
+            planner_input["circuit_states"] = dict(
+                get_default_circuit_breaker().list_states()
+            )
+        except Exception:  # circuit context must never break planning
+            planner_input["circuit_states"] = {}
+        lightweight = ToolRegistry()
+        lightweight.register(KnowledgeSearchTool())
+        grants = ["knowledge.search"]
+        planner_input["available_tools"] = [
+            name
+            for name in lightweight.list_tool_names()
+            if lightweight.validate_permissions(name, grants)
+        ]
+        # MCP server-level health (existing lifecycle evidence, read-only):
+        # informational context for the LLM planner.  Kept distinct from
+        # tool-level health — a healthy server does not imply healthy tools.
+        lifecycle = _current_context().mcp_lifecycle
+        if lifecycle is not None:
+            servers = lifecycle.server_health_summary()
+            if servers:
+                rendered = "; ".join(
+                    f"{s['server_id']}={s['state']}" for s in servers
+                )
+                suffix = f"MCP servers: {rendered}"
+                block = str(planner_input["tool_health_context"])
+                planner_input["tool_health_context"] = (
+                    f"{block}\n{suffix}" if block else suffix
+                )
+    except Exception:  # planning must not fail on health context
+        logger.warning("Failed to build tool-health planning context", exc_info=True)
+        planner_input["tool_health"] = []
+        planner_input["tool_health_context"] = ""
+        planner_input["available_tools"] = []
+    return planner_input
 
 
 def _make_context(state: dict[str, Any]) -> AgentExecutionContext:
@@ -179,7 +378,7 @@ def validate_request_node(state: dict[str, Any]) -> dict[str, Any]:
     # When resuming from a checkpoint, do NOT reset accumulated state
     if state.get("resumed"):
         result = _copy_state(state, errors=list(state.get("errors", [])))
-        _save_checkpoint_if_available(_ctx.checkpointer, "validate_request", result)
+        _save_checkpoint_if_available(_current_context().checkpointer, "validate_request", result)
         return result
 
     result = _copy_state(
@@ -191,7 +390,7 @@ def validate_request_node(state: dict[str, Any]) -> dict[str, Any]:
         errors=[],
         evaluation_loop_count=0,
     )
-    _save_checkpoint_if_available(_ctx.checkpointer, "validate_request", result)
+    _save_checkpoint_if_available(_current_context().checkpointer, "validate_request", result)
     return result
 
 
@@ -204,9 +403,10 @@ def plan_node(state: dict[str, Any]) -> dict[str, Any]:
     context = _make_context(state)
 
     # F1: Use LLM planner when model provider is available
-    if _ctx.model_provider is not None:
-        planner: BaseAgent = LLMPlannerAgent(model_provider=_ctx.model_provider)
-        logger.info("Using LLM planner (provider=%s)", _ctx.model_provider.provider_name)
+    provider = _current_context().model_provider
+    if provider is not None:
+        planner: BaseAgent = LLMPlannerAgent(model_provider=provider)
+        logger.info("Using LLM planner (provider=%s)", provider.provider_name)
     else:
         planner = PlannerAgent()
         logger.info("Using deterministic planner (no model provider configured)")
@@ -219,11 +419,11 @@ def plan_node(state: dict[str, Any]) -> dict[str, Any]:
             state,
             status=RequestStatus.EXECUTING.value,
         )
-        _save_checkpoint_if_available(_ctx.checkpointer, "plan", result_state)
+        _save_checkpoint_if_available(_current_context().checkpointer, "plan", result_state)
         return result_state
 
     result = planner.execute(
-        {"intent": state.get("intent", "")},
+        _build_planner_input(state),
         context,
     )
 
@@ -240,7 +440,7 @@ def plan_node(state: dict[str, Any]) -> dict[str, Any]:
         current_task_index=0,
         status=RequestStatus.EXECUTING.value,
     )
-    _save_checkpoint_if_available(_ctx.checkpointer, "plan", result_state)
+    _save_checkpoint_if_available(_current_context().checkpointer, "plan", result_state)
     return result_state
 
 
@@ -268,12 +468,29 @@ def execute_agent_node(state: dict[str, Any]) -> dict[str, Any]:
     # F2: Route to appropriate agent based on task type
     agent_type = task.get("assigned_agent_type", "research")
 
-    if agent_type == "rag" and _ctx.retrieval_service is not None:
-        agent: BaseAgent = RAGAgent(retrieval_service=_ctx.retrieval_service)
+    # Build the tool registry once per node execution: the WS6 approval gate
+    # reads server-side tool risk from it and the research agent executes
+    # through it (one registry/MCP lifecycle per task, never two).
+    tool_name = str((task.get("input_data") or {}).get("tool_name", ""))
+    registry: ToolRegistry | None = None
+    if tool_name or agent_type != "rag":
+        registry = _build_registry()
+
+    # WS6: pause BEFORE executing a high-risk task (the legacy post-execution
+    # gate in retry_or_complete could not stop an action that already ran).
+    gate_state = _legacy_approval_gate(state, task, registry)
+    if gate_state is not None:
+        # Persist the paused/failed state — resume loads it from here.
+        _save_checkpoint_if_available(
+            _current_context().checkpointer, "execute_agent", gate_state
+        )
+        return gate_state
+
+    if agent_type == "rag" and _current_context().retrieval_service is not None:
+        agent: BaseAgent = RAGAgent(retrieval_service=_current_context().retrieval_service)
         logger.info("Using RAGAgent for task %s", task.get("task_id", ""))
     else:
-        registry = _build_registry()
-        agent = ResearchAgent(registry=registry)
+        agent = ResearchAgent(registry=registry or _build_registry())
         logger.info("Using ResearchAgent for task %s", task.get("task_id", ""))
 
     input_data = task.get("input_data", {})
@@ -289,7 +506,7 @@ def execute_agent_node(state: dict[str, Any]) -> dict[str, Any]:
         current_task=task,
         tool_calls=existing_tool_calls,
     )
-    _save_checkpoint_if_available(_ctx.checkpointer, "execute_agent", result_state)
+    _save_checkpoint_if_available(_current_context().checkpointer, "execute_agent", result_state)
     return result_state
 
 
@@ -361,8 +578,8 @@ def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
         default_max_retries=settings.task_default_max_retries,
     )
     factory = AgentFactory(
-        retrieval_service=_ctx.retrieval_service,
-        model_provider=_ctx.model_provider,
+        retrieval_service=_current_context().retrieval_service,
+        model_provider=_current_context().model_provider,
         tool_registry=_build_registry(),
     )
 
@@ -380,21 +597,21 @@ def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     def _checkpoint(snapshot: dict[str, Any]) -> None:
-        if _ctx.checkpointer is None:
+        if _current_context().checkpointer is None:
             return
         full_snapshot = dict(state)
         full_snapshot["task_records"] = snapshot.get("task_records", {})
         full_snapshot["errors"] = list(state.get("errors", [])) + list(snapshot.get("errors", []))
-        _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", full_snapshot)
+        _save_checkpoint_if_available(_current_context().checkpointer, "multi_agent_execute", full_snapshot)
 
     approved_task_ids = set(state.get("approved_task_ids", []) or [])
     executor = MultiAgentExecutor(
         config=config,
         agent_factory=factory,
-        approval_service=_ctx.approval_service,
+        approval_service=_current_context().approval_service,
         checkpoint_callback=_checkpoint,
         audit_callback=_audit,
-        tracer=_ctx.tracer,
+        tracer=_current_context().tracer,
     )
 
     try:
@@ -443,7 +660,7 @@ def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
             audit_events=list(state.get("audit_events", [])) + collected_audit,
             errors=list(state.get("errors", [])) + outcome.errors,
         )
-        _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", result_state)
+        _save_checkpoint_if_available(_current_context().checkpointer, "multi_agent_execute", result_state)
         return result_state
 
     # Final agent result for evaluation/display.
@@ -466,7 +683,7 @@ def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
             audit_events=list(state.get("audit_events", [])) + collected_audit,
             errors=list(state.get("errors", [])) + outcome.errors,
         )
-        _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", result_state)
+        _save_checkpoint_if_available(_current_context().checkpointer, "multi_agent_execute", result_state)
         return result_state
 
     answer = final_record.get("output", {}).get("answer", final_record.get("summary", ""))
@@ -533,7 +750,7 @@ def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
             pass
     except Exception as exc:
         logger.warning("Workflow evaluation failed (non-fatal): %s", exc)
-    _save_checkpoint_if_available(_ctx.checkpointer, "multi_agent_execute", result_state)
+    _save_checkpoint_if_available(_current_context().checkpointer, "multi_agent_execute", result_state)
     return result_state
 
 
@@ -606,7 +823,8 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # Phase 5.3D: LLM critic (optional, when provider is configured)
     critic_details: dict[str, Any] = {}
-    if _ctx.critic is not None:
+    critic = _current_context().critic
+    if critic is not None:
         try:
             # Build evidence context for the critic
             evidence_text = ""
@@ -614,7 +832,7 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(item, dict):
                     evidence_text += f"\n- {item.get('source', 'unknown')}: {str(item.get('snippet', ''))[:200]}"
 
-            critic_result = _ctx.critic.evaluate_response(
+            critic_result = critic.evaluate_response(
                 query=state.get("intent", ""),
                 response_text=agent_result.result.get("answer", agent_result.summary),
                 evidence=evidence_text[:2000],
@@ -663,7 +881,7 @@ def evaluate_node(state: dict[str, Any]) -> dict[str, Any]:
         evaluation=evaluation.model_dump(),
         status=RequestStatus.EVALUATING.value,
     )
-    _save_checkpoint_if_available(_ctx.checkpointer, "evaluate", result_state)
+    _save_checkpoint_if_available(_current_context().checkpointer, "evaluate", result_state)
     return result_state
 
 
@@ -711,12 +929,18 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
         task = state.get("current_task", {})
         raw_risk = task.get("risk_level", "low")
         risk_level = raw_risk.value if hasattr(raw_risk, "value") else str(raw_risk)
-        if risk_level.lower() in _APPROVAL_REQUIRED_LEVELS:
+        approved_ids = set(state.get("approved_task_ids", []) or [])
+        current_task_id = str(task.get("task_id", ""))
+        if (
+            risk_level.lower() in _APPROVAL_REQUIRED_LEVELS
+            and current_task_id not in approved_ids
+        ):
             # Persist an approval request via the DB-backed service
             approval_id = state.get("approval_id", "")
-            if _ctx.approval_service is not None and not approval_id:
+            approval_service = _current_context().approval_service
+            if approval_service is not None and not approval_id:
                 try:
-                    approval = _ctx.approval_service.create_approval_request(
+                    approval = approval_service.create_approval_request(
                         job_id=state.get("job_id", ""),
                         request_id=state.get("request_id", ""),
                         workflow_id=state.get("workflow_id", ""),
@@ -748,7 +972,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
                 evaluation_loop_count=eval_loop_count,
                 recovery_decision=recovery_decision,
             )
-            _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
+            _save_checkpoint_if_available(_current_context().checkpointer, "retry_or_complete", result_state)
             return result_state
 
         # Move to next task or complete
@@ -763,7 +987,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
                 evaluation_loop_count=eval_loop_count,
                 recovery_decision=recovery_decision,
             )
-            _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
+            _save_checkpoint_if_available(_current_context().checkpointer, "retry_or_complete", result_state)
             return result_state
         recovery_decision["action"] = "advance_to_next_task"
         recovery_decision["next_task_index"] = next_index
@@ -775,7 +999,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
             evaluation_loop_count=eval_loop_count,
             recovery_decision=recovery_decision,
         )
-        _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
+        _save_checkpoint_if_available(_current_context().checkpointer, "retry_or_complete", result_state)
         return result_state
 
     if evaluation.verdict == EvaluationVerdict.RETRY and retry_count < max_retries:
@@ -796,7 +1020,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
             evaluation_loop_count=eval_loop_count,
             recovery_decision=recovery_decision,
         )
-        _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
+        _save_checkpoint_if_available(_current_context().checkpointer, "retry_or_complete", result_state)
         return result_state
 
     # Terminal failure
@@ -811,7 +1035,7 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
         evaluation_loop_count=eval_loop_count,
         recovery_decision=recovery_decision,
     )
-    _save_checkpoint_if_available(_ctx.checkpointer, "retry_or_complete", result_state)
+    _save_checkpoint_if_available(_current_context().checkpointer, "retry_or_complete", result_state)
     return result_state
 
 
@@ -834,7 +1058,7 @@ def _traced_node(fn: Any, name: str) -> Any:
     """Wrap a graph node with an OpenTelemetry-style trace span."""
 
     def wrapped(state: dict[str, Any]) -> dict[str, Any]:
-        tracer = _ctx.tracer
+        tracer = _current_context().tracer
         if tracer is None:
             return fn(state)
         with tracer.span(name):
@@ -842,6 +1066,18 @@ def _traced_node(fn: Any, name: str) -> Any:
 
     wrapped.__name__ = f"{name}_traced"
     return wrapped
+
+
+def route_after_execute(state: dict[str, Any]) -> str:
+    """Conditional edge after execute_agent.
+
+    WS6: when the serial path's pre-execution approval gate paused the run,
+    the workflow must END at the pause — flowing into ``evaluate`` would
+    overwrite the ACTION_REQUIRES_APPROVAL status with a terminal failure.
+    """
+    if state.get("status") == RequestStatus.ACTION_REQUIRES_APPROVAL.value:
+        return "end"
+    return "evaluate"
 
 
 def build_execution_graph() -> StateGraph:
@@ -866,7 +1102,14 @@ def build_execution_graph() -> StateGraph:
 
     # Linear edges
     graph.add_edge("validate_request", "plan")
-    graph.add_edge("execute_agent", "evaluate")
+    graph.add_conditional_edges(
+        "execute_agent",
+        route_after_execute,
+        {
+            "evaluate": "evaluate",
+            "end": END,
+        },
+    )
     graph.add_edge("evaluate", "retry_or_complete")
 
     # After planning, route multi-task plans to the dependency engine.
@@ -965,15 +1208,25 @@ def execute_workflow(
     """
     workflow_id = workflow_id or f"wf-{uuid.uuid4().hex[:12]}"
 
-    # F1+F8+F2: Set workflow context with injected dependencies
+    # Phase 6G: execution-scoped context (ContextVar).  Concurrent synchronous
+    # executions in one process no longer share the module-level singleton.
+    # _ctx is ALSO populated for backwards compatibility: direct graph-node
+    # calls (tests, external callers) without an execution scope still work.
+    exec_ctx = _WorkflowContext()
+    exec_ctx.model_provider = model_provider
+    exec_ctx.retrieval_service = retrieval_service
+    exec_ctx.critic = LLMCritic(model_provider=model_provider) if model_provider else None
+    exec_ctx.approval_service = approval_service
+    exec_ctx.tracer = Tracer(request_id=request_id, workflow_id=workflow_id)
+    if trace_id:
+        exec_ctx.tracer.context.request_id = trace_id
     _ctx.model_provider = model_provider
     _ctx.retrieval_service = retrieval_service
-    _ctx.critic = LLMCritic(model_provider=model_provider) if model_provider else None
+    _ctx.critic = exec_ctx.critic
     _ctx.approval_service = approval_service
-    _ctx.tracer = Tracer(request_id=request_id, workflow_id=workflow_id)
-    if trace_id:
-        _ctx.tracer.context.request_id = trace_id
+    _ctx.tracer = exec_ctx.tracer
 
+    token = _execution_ctx.set(exec_ctx)
     try:
         with track_workflow() as wf_meta:
             final_state = _execute_workflow_inner(
@@ -985,12 +1238,16 @@ def execute_workflow(
 
         # Attach trace summary (sanitized) to the final state
         try:
-            final_state["trace_summary"] = _ctx.tracer.log_summary()
+            final_state["trace_summary"] = exec_ctx.tracer.log_summary()
         except Exception as exc:
             logger.warning("Could not build trace summary: %s", exc)
         return final_state
     finally:
-        _ctx.reset()
+        _execution_ctx.reset(token)
+        # Reset the legacy global ONLY if it still matches this run (a nested
+        # or racing execute_workflow call may have re-populated it).
+        if _ctx.tracer is exec_ctx.tracer:
+            _ctx.reset()
 
 
 def _execute_workflow_inner(
@@ -1053,14 +1310,16 @@ def _resume_after_approval(
 ) -> dict[str, Any]:
     """Continue a workflow after an approval decision.
 
-    Legacy (single-task) runs: the approved task has already executed;
-    advance to the next task without re-running it and without re-creating
-    its approval.
-
     Multi-agent runs: the gated task has NOT executed yet (the engine pauses
     *before* running a task that needs approval).  We mark that task as
     approved and let the dependency engine continue from the checkpoint,
     skipping tasks that already completed.
+
+    Legacy (serial) runs: the approval gate also pauses BEFORE execution
+    (WS6), so the approved task has NOT run yet.  Mark it approved and
+    re-enter the graph so execute_agent runs it exactly once; the graph
+    skips tasks that already completed via status checks and the
+    approved_task_ids set.
     """
     state["status"] = RequestStatus.EXECUTING.value
     state["approval_required"] = False
@@ -1077,19 +1336,15 @@ def _resume_after_approval(
         state.pop("approval_task_id", None)
         return _execute_with_state(state, workflow_id, checkpointer)
 
+    # Legacy serial path: grant approval to the task at the current index
+    # (it paused pre-execution) and re-enter the graph to run it.
     tasks = state.get("plan", {}).get("tasks", [])
-    next_index = int(state.get("current_task_index", 0)) + 1
-
-    if next_index >= len(tasks):
-        # All tasks approved and complete
-        return _copy_state(
-            state,
-            status=RequestStatus.COMPLETED.value,
-            final_result=state.get("agent_result", {}),
-            current_task_index=next_index,
-        )
-
-    state["current_task_index"] = next_index
+    task_index = int(state.get("current_task_index", 0))
+    approved = set(state.get("approved_task_ids", []) or [])
+    if 0 <= task_index < len(tasks):
+        approved.add(str(tasks[task_index].get("task_id", "")))
+    state["approved_task_ids"] = sorted(approved)
+    state.pop("approval_task_id", None)
     state["current_task"] = {}
     return _execute_with_state(state, workflow_id, checkpointer)
 
@@ -1100,7 +1355,10 @@ def _execute_with_state(
     checkpointer: WorkflowCheckpointer | None = None,
 ) -> dict[str, Any]:
     """Execute the workflow starting from a given state."""
-    # Store checkpointer in context so nodes can save checkpoints
+    # Store the checkpointer in BOTH the execution-scoped context (correct
+    # under concurrency) and the legacy global (direct node-call compat).
+    ctx = _current_context()
+    ctx.checkpointer = checkpointer
     _ctx.checkpointer = checkpointer
 
     graph = build_execution_graph()

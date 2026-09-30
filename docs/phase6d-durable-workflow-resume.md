@@ -1,5 +1,10 @@
 # Phase 6D: Durable Workflow Resume After Worker Crash
 
+> **Phase 6E update:** Task-level durable checkpointing is now implemented on top of
+> this phase — see [Phase 6E](phase6e-task-level-checkpointing.md). Phase 6D's
+> wave-boundary resume remains the baseline; 6E narrows the crash window from
+> "everything since the last wave" to "everything since the last task completion".
+
 ## Overview
 
 AegisForge Phase 6D closes the most critical durability gap in the distributed worker system: **workflow resume from durable checkpoints after worker crash**.
@@ -113,7 +118,7 @@ pytest tests/ -q
 
 ## Limitations
 
-1. **In-flight work is lost**: If the worker crashes while executing a task, that task's partial computation is lost. The task will be re-executed from scratch on resume.
+1. **In-flight work is lost**: If the worker crashes while executing a task, that task's partial computation is lost. The task will be re-executed from scratch on resume. *(Phase 6E narrows this: tasks that had already completed when the crash occurred are now preserved even mid-wave — only the task executing at the moment of the crash is lost.)*
 
 2. **No exactly-once**: Under narrow failure races, a task could be executed twice. External side effects must remain idempotent.
 

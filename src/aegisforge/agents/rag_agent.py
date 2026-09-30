@@ -83,6 +83,10 @@ class RAGAgent(BaseAgent):
         retrieval_query = RetrievalQuery(
             query=query,
             organization_id=context.organization_id,
+            # Owner scope: the RAG agent may only retrieve the requesting
+            # user's own chunks (mirrors REST document authorization; P0 fix
+            # for the shared-default-org retrieval leak).
+            user_id=context.user_id,
             top_k=top_k,
             similarity_threshold=similarity_threshold,
         )

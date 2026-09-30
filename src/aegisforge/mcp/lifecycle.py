@@ -105,6 +105,20 @@ class MCPLifecycleManager:
             if entry.health.connected:
                 self.disconnect(entry.config.server_id)
 
+    def server_health_summary(self) -> list[dict[str, str]]:
+        """Bounded server-level health snapshot for planning contexts (6F).
+
+        Read-only and side-effect free (no health-check polling — that stays
+        owned by this manager).  Server ids come from the operator-controlled
+        catalog; only the bounded state enum is exposed, never errors or
+        payloads.  Distinct from tool-level health (ToolHealthTracker): a
+        healthy server does not imply healthy tools, and vice versa.
+        """
+        return [
+            {"server_id": entry.config.server_id, "state": str(entry.health.state)}
+            for entry in self._catalog.list_servers()
+        ]
+
     def reconnect(self, server_id: str) -> bool:
         """Attempt a bounded reconnect with backoff."""
         entry = self._catalog.get(server_id)
