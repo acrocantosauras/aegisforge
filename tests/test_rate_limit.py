@@ -91,3 +91,71 @@ class TestRateLimit:
         for _ in range(5):
             resp = client.get("/api/v1/requests", headers=headers)
             assert resp.status_code == 200
+
+
+class TestWS13ProductionRateLimit:
+    """WS13: Redis trouble must never create an unlimited request path."""
+
+    def _production_client(self, **overrides) -> TestClient:  # type: ignore[no-untyped-def]
+        get_engine.cache_clear()
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            secret_key="ws13-production-secret-0123456789abcdef",
+            environment="production",
+            rate_limit_enabled=True,
+            rate_limit_max_requests=5,
+            rate_limit_window_seconds=60,
+            redis_url="redis://localhost:6399/0",  # nothing listens here
+            **overrides,
+        )
+        engine = get_engine(settings.database_url)
+        Base.metadata.create_all(bind=engine)
+        return TestClient(create_app(settings=settings))
+
+    def test_redis_unreachable_still_bounded_in_production(self) -> None:
+        """Connect-time Redis failure → bounded in-memory fallback, not NO limit.
+
+        Regression: an unreachable Redis must not silently disable rate
+        limiting in production (the unlimited-request path).
+        """
+        client = self._production_client()
+        for _ in range(5):
+            resp = client.get("/api/v1/requests")
+            assert resp.status_code == 401
+        resp = client.get("/api/v1/requests")
+        assert resp.status_code == 429, "Redis down must not mean unlimited requests"
+        assert resp.headers.get("Retry-After") is not None
+
+    def test_runtime_redis_failure_fails_open_with_critical_log(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        """Documented fail-open: Redis dying mid-flight allows requests,
+        but must log CRITICAL so operators see the limiter is down."""
+        import logging
+
+        import aegisforge.security.rate_limit as rl
+
+        class _Boom:
+            def incr(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                raise ConnectionError("redis died mid-window")
+
+            def expire(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                raise ConnectionError("redis died mid-window")
+
+        prev_client, prev_available = rl._redis_client, rl._redis_available
+        rl._redis_client, rl._redis_available = _Boom(), True
+        try:
+            client = self._production_client()
+            with caplog.at_level(logging.CRITICAL, logger="aegisforge.security.rate_limit"):
+                resp = client.get("/api/v1/requests")
+            # Fail-open (documented): the request is allowed, not dropped…
+            assert resp.status_code in {200, 401}
+            # …and the outage is loudly recorded.
+            assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        finally:
+            rl._redis_client, rl._redis_available = prev_client, prev_available
+
+    def test_exempt_probe_survives_exhausted_limit(self) -> None:
+        client = self._production_client()
+        for _ in range(6):
+            client.get("/api/v1/requests")
+        # Liveness probe stays reachable even when the bucket is exhausted.
+        assert client.get("/api/v1/health").status_code == 200

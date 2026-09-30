@@ -44,6 +44,7 @@ class VectorStore(ABC):
         self,
         entries: list[VectorStoreEntry],
         organization_id: str = "",
+        owner_id: str = "",
     ) -> None:
         """Add entries to the vector store."""
         ...
@@ -56,18 +57,19 @@ class VectorStore(ABC):
         organization_id: str = "",
         metadata_filter: dict[str, Any] | None = None,
         similarity_threshold: float = 0.0,
+        owner_id: str = "",
     ) -> list[SearchResult]:
         """Search the vector store by embedding similarity."""
         ...
 
     @abstractmethod
-    def delete_by_document(self, document_id: str, organization_id: str = "") -> int:
+    def delete_by_document(self, document_id: str, organization_id: str = "", owner_id: str = "") -> int:
         """Delete all entries for a document. Returns count deleted."""
         ...
 
     @abstractmethod
-    def count(self, organization_id: str = "") -> int:
-        """Count entries, optionally filtered by organization."""
+    def count(self, organization_id: str = "", owner_id: str = "") -> int:
+        """Count entries, optionally filtered by organization + owner."""
         ...
 
     def lexical_search(
@@ -76,6 +78,7 @@ class VectorStore(ABC):
         top_k: int = 10,
         organization_id: str = "",
         metadata_filter: dict[str, Any] | None = None,
+        owner_id: str = "",
     ) -> list[SearchResult]:
         """Keyword/lexical search over entry content (Phase 5).
 
@@ -133,12 +136,33 @@ class InMemoryVectorStore(VectorStore):
     def __init__(self) -> None:
         self._entries: list[VectorStoreEntry] = []
         self._org_map: dict[str, str] = {}  # entry_id -> organization_id
+        self._owner_map: dict[str, str] = {}  # entry_id -> owning user_id
 
-    def add(self, entries: list[VectorStoreEntry], organization_id: str = "") -> None:
+    def add(
+        self,
+        entries: list[VectorStoreEntry],
+        organization_id: str = "",
+        owner_id: str = "",
+    ) -> None:
         for entry in entries:
             self._entries.append(entry)
             if organization_id:
                 self._org_map[entry.id] = organization_id
+            if owner_id:
+                self._owner_map[entry.id] = owner_id
+
+    def _visible(self, entry: VectorStoreEntry, organization_id: str, owner_id: str) -> bool:
+        """Authorization predicate (fail-closed, org AND owner).
+
+        Mirrors the REST authorization model: within a shared organization,
+        a chunk is readable only by the user who ingested its document.
+        An empty owner scope matches only owner-less chunks, so an omitted
+        scope can never widen visibility.
+        """
+        return (
+            self._org_map.get(entry.id, "") == organization_id
+            and self._owner_map.get(entry.id, "") == owner_id
+        )
 
     def search(
         self,
@@ -147,12 +171,16 @@ class InMemoryVectorStore(VectorStore):
         organization_id: str = "",
         metadata_filter: dict[str, Any] | None = None,
         similarity_threshold: float = 0.0,
+        owner_id: str = "",
     ) -> list[SearchResult]:
         results: list[SearchResult] = []
 
         for entry in self._entries:
-            # Organization filtering
-            if organization_id and self._org_map.get(entry.id, "") != organization_id:
+            # Organization + owner filtering (fail-closed): an entry is
+            # visible only when BOTH scopes exactly match the caller's.
+            # The org check alone leaked chunks between users while self-
+            # registration shares the default organization (P0 regression).
+            if not self._visible(entry, organization_id, owner_id):
                 continue
 
             # Metadata filtering
@@ -182,22 +210,33 @@ class InMemoryVectorStore(VectorStore):
         results.sort(key=lambda r: r.score, reverse=True)
         return results[:top_k]
 
-    def delete_by_document(self, document_id: str, organization_id: str = "") -> int:
+    def delete_by_document(
+        self,
+        document_id: str,
+        organization_id: str = "",
+        owner_id: str = "",
+    ) -> int:
+        # Fail-closed: only delete chunks that belong to the caller's org
+        # AND owner scope; an empty scope never widens the deletion.
         original_count = len(self._entries)
         self._entries = [
             e
             for e in self._entries
             if not (
                 e.metadata.get("document_id") == document_id
-                and (not organization_id or self._org_map.get(e.id, "") == organization_id)
+                and self._visible(e, organization_id, owner_id)
             )
         ]
         return original_count - len(self._entries)
 
-    def count(self, organization_id: str = "") -> int:
-        if not organization_id:
-            return len(self._entries)
-        return sum(1 for eid in self._entries if self._org_map.get(eid.id, "") == organization_id)
+    def count(self, organization_id: str = "", owner_id: str = "") -> int:
+        # Fail-closed: count only rows in the caller's org + owner scope so
+        # the aggregate cannot reveal other tenants'/users' document volume.
+        return sum(
+            1
+            for eid in self._entries
+            if self._visible(eid, organization_id, owner_id)
+        )
 
     def lexical_search(
         self,
@@ -205,6 +244,7 @@ class InMemoryVectorStore(VectorStore):
         top_k: int = 10,
         organization_id: str = "",
         metadata_filter: dict[str, Any] | None = None,
+        owner_id: str = "",
     ) -> list[SearchResult]:
         """Deterministic keyword search over entry content (in-memory)."""
         if not query or not query.strip():
@@ -213,7 +253,8 @@ class InMemoryVectorStore(VectorStore):
         results: list[SearchResult] = []
 
         for entry in self._entries:
-            if organization_id and self._org_map.get(entry.id, "") != organization_id:
+            # Fail-closed: exact org AND owner match required (see search()).
+            if not self._visible(entry, organization_id, owner_id):
                 continue
             if metadata_filter and any(
                 entry.metadata.get(k) != v for k, v in metadata_filter.items()
@@ -264,6 +305,7 @@ class PgVectorStore(VectorStore):
                     CREATE TABLE IF NOT EXISTS vector_embeddings (
                         id VARCHAR(64) PRIMARY KEY,
                         organization_id VARCHAR(64) NOT NULL DEFAULT '',
+                        owner_id VARCHAR(64) NOT NULL DEFAULT '',
                         content TEXT NOT NULL,
                         embedding vector({self._dimension}) NOT NULL,
                         metadata JSONB DEFAULT '{{}}'::jsonb,
@@ -272,10 +314,45 @@ class PgVectorStore(VectorStore):
                 """
                 )
             )
+            # P0 fix: add the owner column to tables created before the fix.
+            # Existing rows are backfilled from document metadata / the
+            # documents table where possible; anything left with an empty
+            # owner stays invisible to every scoped reader (fail-closed).
+            session.execute(
+                text(
+                    "ALTER TABLE vector_embeddings ADD COLUMN IF NOT EXISTS "
+                    "owner_id VARCHAR(64) NOT NULL DEFAULT ''"
+                )
+            )
+            try:
+                session.execute(
+                    text(
+                        """
+                        UPDATE vector_embeddings v
+                        SET owner_id = COALESCE(
+                            v.metadata->>'owner_id',
+                            (SELECT d.uploaded_by FROM documents d
+                             WHERE d.id = v.metadata->>'document_id'),
+                            ''
+                        )
+                        WHERE v.owner_id = ''
+                        """
+                    )
+                )
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.warning("owner_id backfill skipped (non-fatal): %s", exc)
             session.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS idx_vector_embeddings_org "
                     "ON vector_embeddings (organization_id)"
+                )
+            )
+            session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_vector_embeddings_owner "
+                    "ON vector_embeddings (owner_id)"
                 )
             )
             session.execute(
@@ -293,7 +370,12 @@ class PgVectorStore(VectorStore):
             if session is not None:
                 session.close()
 
-    def add(self, entries: list[VectorStoreEntry], organization_id: str = "") -> None:
+    def add(
+        self,
+        entries: list[VectorStoreEntry],
+        organization_id: str = "",
+        owner_id: str = "",
+    ) -> None:
         self._ensure_table()
         if not entries:
             return
@@ -306,13 +388,14 @@ class PgVectorStore(VectorStore):
                     embedding_str = "[" + ",".join(str(v) for v in entry.embedding) + "]"
                     session.execute(
                         text(
-                            "INSERT INTO vector_embeddings (id, organization_id, content, embedding, metadata) "
-                            "VALUES (:id, :org_id, :content, CAST(:embedding AS vector), "
+                            "INSERT INTO vector_embeddings (id, organization_id, owner_id, content, embedding, metadata) "
+                            "VALUES (:id, :org_id, :owner_id, :content, CAST(:embedding AS vector), "
                             "CAST(:metadata AS jsonb))"
                         ),
                         {
                             "id": entry.id,
                             "org_id": organization_id,
+                            "owner_id": owner_id,
                             "content": entry.content,
                             "embedding": embedding_str,
                             "metadata": json.dumps(entry.metadata),
@@ -332,6 +415,7 @@ class PgVectorStore(VectorStore):
         organization_id: str = "",
         metadata_filter: dict[str, Any] | None = None,
         similarity_threshold: float = 0.0,
+        owner_id: str = "",
     ) -> list[SearchResult]:
         self._ensure_table()
         try:
@@ -341,15 +425,16 @@ class PgVectorStore(VectorStore):
             try:
                 embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-                where_clauses = ["1=1"]
+                # Fail-closed: org AND owner predicates are ALWAYS present.
+                # Org scoping alone leaked chunks between users while self-
+                # registration shares the default organization (P0 fix).
+                where_clauses = ["organization_id = :org_id", "owner_id = :owner_id"]
                 params: dict[str, Any] = {
                     "query_embedding": embedding_str,
                     "top_k": top_k,
+                    "org_id": organization_id,
+                    "owner_id": owner_id,
                 }
-
-                if organization_id:
-                    where_clauses.append("organization_id = :org_id")
-                    params["org_id"] = organization_id
 
                 if similarity_threshold > 0:
                     where_clauses.append(
@@ -395,19 +480,26 @@ class PgVectorStore(VectorStore):
             logger.exception("Failed to search pgvector")
             return []
 
-    def delete_by_document(self, document_id: str, organization_id: str = "") -> int:
+    def delete_by_document(
+        self,
+        document_id: str,
+        organization_id: str = "",
+        owner_id: str = "",
+    ) -> int:
         self._ensure_table()
         try:
             from sqlalchemy import text
 
             session = self._session_factory()
             try:
-                where_clauses = ["metadata->>'document_id' = :doc_id"]
-                params: dict[str, Any] = {"doc_id": document_id}
-
-                if organization_id:
-                    where_clauses.append("organization_id = :org_id")
-                    params["org_id"] = organization_id
+                where_clauses = ["organization_id = :org_id", "owner_id = :owner_id"]
+                params: dict[str, Any] = {
+                    "doc_id": document_id,
+                    # Fail-closed: never delete across tenants or owners, even
+                    # when the caller omits a scope.
+                    "org_id": organization_id,
+                    "owner_id": owner_id,
+                }
 
                 where_sql = " AND ".join(where_clauses)
                 result = session.execute(
@@ -421,20 +513,22 @@ class PgVectorStore(VectorStore):
             logger.exception("Failed to delete from pgvector")
             return 0
 
-    def count(self, organization_id: str = "") -> int:
+    def count(self, organization_id: str = "", owner_id: str = "") -> int:
         self._ensure_table()
         try:
             from sqlalchemy import text
 
             session = self._session_factory()
             try:
-                if organization_id:
-                    row = session.execute(
-                        text("SELECT COUNT(*) FROM vector_embeddings WHERE organization_id = :org_id"),
-                        {"org_id": organization_id},
-                    ).fetchone()
-                else:
-                    row = session.execute(text("SELECT COUNT(*) FROM vector_embeddings")).fetchone()
+                # Fail-closed: always scope to the caller's org AND owner so
+                # the count cannot reveal other tenants'/users' volume.
+                row = session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM vector_embeddings "
+                        "WHERE organization_id = :org_id AND owner_id = :owner_id"
+                    ),
+                    {"org_id": organization_id, "owner_id": owner_id},
+                ).fetchone()
                 return row[0] if row else 0
             finally:
                 session.close()
@@ -464,6 +558,7 @@ class PgVectorStore(VectorStore):
         top_k: int = 10,
         organization_id: str = "",
         metadata_filter: dict[str, Any] | None = None,
+        owner_id: str = "",
     ) -> list[SearchResult]:
         """PostgreSQL-native lexical search via tsvector/tsquery (Phase 5)."""
         self._ensure_table()
@@ -475,16 +570,16 @@ class PgVectorStore(VectorStore):
             session = self._session_factory()
             try:
                 self._ensure_tsvector_index(session)
-                where_clauses: list[str] = []
+                where_clauses: list[str] = ["organization_id = :org_id", "owner_id = :owner_id"]
                 params: dict[str, Any] = {
                     "query_text": query,
                     "top_k": top_k,
+                    # Fail-closed: org AND owner predicates are ALWAYS present.
+                    "org_id": organization_id,
+                    "owner_id": owner_id,
                 }
-                if organization_id:
-                    where_clauses.append("organization_id = :org_id")
-                    params["org_id"] = organization_id
 
-                where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+                where_sql = " AND ".join(where_clauses)
                 sql = text(
                     f"""
                     SELECT id, content, metadata,

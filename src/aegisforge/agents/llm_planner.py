@@ -217,7 +217,9 @@ class LLMPlannerAgent(BaseAgent):
         # Try LLM planning first
         if self._model_provider is not None:
             try:
-                llm_result = self._plan_with_llm(intent, context)
+                # Phase 6F: bounded, planner-safe tool-health context (if any).
+                tool_health_context = str(input_data.get("tool_health_context", "") or "")
+                llm_result = self._plan_with_llm(intent, context, tool_health_context)
                 if llm_result.validation_passed:
                     return AgentResult(
                         agent_name=self.name,
@@ -257,12 +259,25 @@ class LLMPlannerAgent(BaseAgent):
         return fallback_result
 
     def _plan_with_llm(
-        self, intent: str, context: AgentExecutionContext
+        self,
+        intent: str,
+        context: AgentExecutionContext,
+        tool_health_context: str = "",
     ) -> LLMPlanResult:
-        """Use the LLM to generate a structured plan."""
+        """Use the LLM to generate a structured plan.
+
+        Phase 6F: when ``tool_health_context`` is non-empty it is a compact,
+        bounded, pre-rendered block (no raw errors/payloads/history) appended
+        to the user message so the LLM can prefer healthy tools.  It is a
+        planning signal only — it cannot bypass validation, permissions, or
+        the execution registry.
+        """
+        user_content = f"Decompose this request into tasks:\n\n{intent}"
+        if tool_health_context:
+            user_content = f"{user_content}\n\n{tool_health_context}"
         messages = [
             {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Decompose this request into tasks:\n\n{intent}"},
+            {"role": "user", "content": user_content},
         ]
 
         if self._model_provider is None:

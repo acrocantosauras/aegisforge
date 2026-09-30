@@ -27,10 +27,20 @@ def list_requests_route(
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
 ) -> list[RequestModel]:
-    """List requests for the user's organization (tenant-isolated)."""
+    """List the caller's own requests (org + owner scoped).
+
+    SECURITY: registration currently places all self-registered users in a
+    shared default organization, so an org-only filter would expose every
+    user's intents/context to every other user.  Owner scoping keeps the
+    history view private per user; the organization filter remains as the
+    hard tenant boundary.
+    """
     requests = (
         db.query(RequestModel)
-        .filter(RequestModel.organization_id == user.organization_id)
+        .filter(
+            RequestModel.organization_id == user.organization_id,
+            RequestModel.requested_by == user.id,
+        )
         .order_by(RequestModel.created_at.desc())
         .limit(100)
         .all()
@@ -45,8 +55,9 @@ def get_request_route(
     user: UserModel = Depends(get_current_user),
 ) -> RequestModel:
     request = get_request(db, request_id)
-    if request.requested_by != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    if request.organization_id != user.organization_id or request.requested_by != user.id:
+        # 404 (never 403): must not confirm the existence of another user's request.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
     return request
 
 
@@ -58,6 +69,7 @@ def update_request_status_route(
     user: UserModel = Depends(get_current_user),
 ) -> RequestModel:
     request = get_request(db, request_id)
-    if request.requested_by != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed")
+    if request.organization_id != user.organization_id or request.requested_by != user.id:
+        # 404 (never 403): must not confirm the existence of another user's request.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
     return update_request_status(db, request_id, payload.status)

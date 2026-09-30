@@ -209,6 +209,134 @@ try:
         "Total jobs recovered from crashed workers",
     )
 
+    # Phase 6C — Enhanced queue observability
+    QUEUE_JOBS_DEQUEUED_TOTAL = Counter(
+        "queue_jobs_dequeued_total",
+        "Total jobs dequeued from the queue",
+    )
+    QUEUE_JOBS_CLAIMED_TOTAL = Counter(
+        "queue_jobs_claimed_total",
+        "Total jobs successfully claimed by workers",
+    )
+    QUEUE_JOBS_ABANDONED_TOTAL = Counter(
+        "queue_jobs_abandoned_total",
+        "Total jobs that reached terminal failure (max retries exhausted)",
+    )
+    QUEUE_WAIT_TIME = Histogram(
+        "queue_wait_time_seconds",
+        "Time a job spends waiting in the queue before being dequeued",
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+    )
+    WORKER_REGISTRATIONS_TOTAL = Counter(
+        "worker_registrations_total",
+        "Total worker registrations",
+    )
+    WORKER_DEREGISTRATIONS_TOTAL = Counter(
+        "worker_deregistrations_total",
+        "Total worker deregistrations",
+    )
+    WORKER_HEARTBEAT_FAILURES_TOTAL = Counter(
+        "worker_heartbeat_failures_total",
+        "Total worker heartbeat failures",
+    )
+    ACTIVE_CLAIMS = Gauge(
+        "active_claims",
+        "Number of currently active (unexpired) claims",
+    )
+    CLAIM_EXPIRATIONS_TOTAL = Counter(
+        "claim_expirations_total",
+        "Total claims that expired (worker may have crashed)",
+    )
+    CLAIM_EXTENSIONS_TOTAL = Counter(
+        "claim_extensions_total",
+        "Total visibility-timeout extensions via heartbeat",
+    )
+
+    # Phase 6C — Stuck job detection
+    STUCK_JOBS_DETECTED_TOTAL = Counter(
+        "stuck_jobs_detected_total",
+        "Total jobs detected as stuck by the watchdog",
+    )
+    STUCK_JOBS_RECOVERED_TOTAL = Counter(
+        "stuck_jobs_recovered_total",
+        "Total stuck jobs that were recovered",
+    )
+
+    # Phase 6D — Durable workflow resume
+    WORKFLOW_CHECKPOINT_RESUMES_TOTAL = Counter(
+        "workflow_checkpoint_resumes_total",
+        "Total workflows resumed from durable checkpoints after failure",
+    )
+
+    # Phase 6E — Task-level durable checkpointing
+    WORKFLOW_TASK_CHECKPOINTS_TOTAL = Counter(
+        "workflow_task_checkpoints_total",
+        "Per-task durable checkpoints emitted as tasks reach terminal state",
+        ["status"],
+    )
+    WORKFLOW_TASKS_SKIPPED_ON_RESUME_TOTAL = Counter(
+        "workflow_tasks_skipped_on_resume_total",
+        "Tasks restored from a durable checkpoint and not re-executed",
+        ["status"],
+    )
+
+    # Phase 6F — Tool health (bounded labels only: no tool names, no errors)
+    TOOL_HEALTH_STATE_CHANGES_TOTAL = Counter(
+        "tool_health_state_changes_total",
+        "Tool health state transitions (bounded from/to states)",
+        ["from_state", "to_state"],
+    )
+    TOOL_HEALTH_STATES = Gauge(
+        "tool_health_states",
+        "Number of known tools currently in each bounded health state",
+        ["state"],
+    )
+
+    # Phase 6G — Tool circuit breaker (bounded labels only: circuit states)
+    TOOL_CIRCUIT_STATE_CHANGES_TOTAL = Counter(
+        "tool_circuit_state_changes_total",
+        "Tool circuit breaker state transitions (bounded from/to states)",
+        ["from_state", "to_state"],
+    )
+    TOOL_CIRCUIT_FAST_FAILS_TOTAL = Counter(
+        "tool_circuit_fast_fails_total",
+        "Executions fast-failed by an OPEN circuit without executing the tool",
+    )
+    TOOL_CIRCUIT_PROBES_TOTAL = Counter(
+        "tool_circuit_probes_total",
+        "HALF_OPEN probe attempts by outcome",
+        ["outcome"],
+    )
+
+    # Phase 6G — Worker capacity (bounded labels only)
+    WORKER_ACTIVE_JOBS = Gauge(
+        "worker_active_jobs",
+        "Number of jobs a worker is currently executing",
+    )
+    WORKER_CAPACITY = Gauge(
+        "worker_capacity",
+        "Advertised worker capacity (max concurrent jobs)",
+    )
+    WORKER_AVAILABLE_SLOTS = Gauge(
+        "worker_available_slots",
+        "Worker capacity minus active jobs",
+    )
+
+    # Phase 6G — Checkpoint latency (durability overhead visibility)
+    CHECKPOINT_SAVE_LATENCY = Histogram(
+        "checkpoint_save_latency_seconds",
+        "Checkpoint save duration (workflow + task-level)",
+        ["kind"],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+    )
+
+    # Phase 6G — Failure taxonomy (bounded classification labels)
+    FAILURE_CLASSIFICATIONS_TOTAL = Counter(
+        "failure_classifications_total",
+        "Task failures by bounded taxonomy class",
+        ["failure_class", "recovery_action"],
+    )
+
     HAS_PROMETHEUS = True
 
 except ImportError:
@@ -470,3 +598,242 @@ def record_job_recovered() -> None:
     if not HAS_PROMETHEUS:
         return
     JOBS_RECOVERED_TOTAL.inc()
+
+
+# --- Phase 6C: Enhanced queue/worker observability ---
+
+
+def record_job_dequeued() -> None:
+    """Record that a job was dequeued from the queue."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_DEQUEUED_TOTAL.inc()
+
+
+def record_job_claimed() -> None:
+    """Record that a job was successfully claimed by a worker."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_CLAIMED_TOTAL.inc()
+
+
+def record_job_abandoned() -> None:
+    """Record that a job reached terminal failure (abandoned)."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_JOBS_ABANDONED_TOTAL.inc()
+
+
+def record_queue_wait_time(seconds: float) -> None:
+    """Record how long a job waited in the queue before being processed."""
+    if not HAS_PROMETHEUS:
+        return
+    QUEUE_WAIT_TIME.observe(max(seconds, 0.0))
+
+
+def record_worker_registration() -> None:
+    """Record a worker registration event."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_REGISTRATIONS_TOTAL.inc()
+
+
+def record_worker_deregistration() -> None:
+    """Record a worker deregistration event."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_DEREGISTRATIONS_TOTAL.inc()
+
+
+def record_worker_heartbeat_failure() -> None:
+    """Record a worker heartbeat failure."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_HEARTBEAT_FAILURES_TOTAL.inc()
+
+
+def set_active_claims(count: int) -> None:
+    """Update the active claims gauge."""
+    if not HAS_PROMETHEUS:
+        return
+    ACTIVE_CLAIMS.set(count)
+
+
+def record_claim_expiration() -> None:
+    """Record that a claim expired (possible worker crash)."""
+    if not HAS_PROMETHEUS:
+        return
+    CLAIM_EXPIRATIONS_TOTAL.inc()
+
+
+def record_claim_extension() -> None:
+    """Record a visibility-timeout extension via heartbeat."""
+    if not HAS_PROMETHEUS:
+        return
+    CLAIM_EXTENSIONS_TOTAL.inc()
+
+
+def record_stuck_job_detected() -> None:
+    """Record that the stuck-job detector found a stuck job."""
+    if not HAS_PROMETHEUS:
+        return
+    STUCK_JOBS_DETECTED_TOTAL.inc()
+
+
+def record_stuck_job_recovered() -> None:
+    """Record that a stuck job was recovered."""
+    if not HAS_PROMETHEUS:
+        return
+    STUCK_JOBS_RECOVERED_TOTAL.inc()
+
+
+# --- Phase 6D: Durable workflow resume ---
+
+
+def record_workflow_checkpoint_resume() -> None:
+    """Record that a workflow was resumed from a durable checkpoint.
+
+    This happens when a job is re-enqueued after a worker crash or
+    stuck-job recovery, and the workflow continues from the last
+    completed node instead of restarting from scratch.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    WORKFLOW_CHECKPOINT_RESUMES_TOTAL.inc()
+
+
+# --- Phase 6E: Task-level durable checkpointing ---
+
+
+def record_workflow_task_checkpoint(status: str) -> None:
+    """Record a per-task durable checkpoint emission.
+
+    Emitted by the scheduler each time a task reaches a terminal state and
+    its record is durably checkpointed. ``status`` is a bounded value:
+    completed, failed, timeout, or denied.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    WORKFLOW_TASK_CHECKPOINTS_TOTAL.labels(status=status).inc()
+
+
+def record_workflow_tasks_skipped_on_resume(status: str) -> None:
+    """Record a task restored from a durable checkpoint and not re-executed.
+
+    Emitted when a resumed run seeds terminal task records from checkpoint
+    state. ``status`` is a bounded value: completed, failed, timeout, or
+    denied.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    WORKFLOW_TASKS_SKIPPED_ON_RESUME_TOTAL.labels(status=status).inc()
+
+
+# --- Phase 6F: Tool health ---
+
+
+def record_tool_health_state_change(from_state: str, to_state: str) -> None:
+    """Record a tool health state transition.
+
+    Labels are strictly bounded states (unknown/healthy/degraded/unavailable)
+    — never tool names, errors, or identifiers beyond the bounded model.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    TOOL_HEALTH_STATE_CHANGES_TOTAL.labels(
+        from_state=from_state, to_state=to_state
+    ).inc()
+
+
+# --- Phase 6G: Circuit breaker ---
+
+
+def record_circuit_state_change(from_state: str, to_state: str) -> None:
+    """Record a tool circuit breaker state transition.
+
+    Labels are strictly bounded circuit states (closed/open/half_open) —
+    never tool names, errors, or identifiers.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    TOOL_CIRCUIT_STATE_CHANGES_TOTAL.labels(
+        from_state=from_state, to_state=to_state
+    ).inc()
+
+
+def record_circuit_fast_fail() -> None:
+    """Record an execution fast-failed by an OPEN circuit."""
+    if not HAS_PROMETHEUS:
+        return
+    TOOL_CIRCUIT_FAST_FAILS_TOTAL.inc()
+
+
+def record_circuit_probe(success: bool) -> None:
+    """Record a HALF_OPEN probe attempt outcome (bounded outcome label)."""
+    if not HAS_PROMETHEUS:
+        return
+    TOOL_CIRCUIT_PROBES_TOTAL.labels(outcome="success" if success else "failure").inc()
+
+
+# --- Phase 6G: Worker capacity ---
+
+
+def set_worker_capacity(capacity: int, active_jobs: int) -> None:
+    """Update worker capacity gauges (active jobs and available slots)."""
+    if not HAS_PROMETHEUS:
+        return
+    WORKER_CAPACITY.set(max(capacity, 0))
+    WORKER_ACTIVE_JOBS.set(max(active_jobs, 0))
+    WORKER_AVAILABLE_SLOTS.set(max(capacity - active_jobs, 0))
+
+
+# --- Phase 6G: Checkpoint latency ---
+
+
+def observe_checkpoint_save(kind: str, duration_seconds: float) -> None:
+    """Observe a checkpoint save duration.
+
+    ``kind`` is a bounded value: workflow, task, or start. Never unbounded.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    bounded = kind if kind in ("workflow", "task", "start") else "other"
+    CHECKPOINT_SAVE_LATENCY.labels(kind=bounded).observe(max(duration_seconds, 0.0))
+
+
+# --- Phase 6G: Failure taxonomy ---
+
+
+def record_failure_classification(failure_class: str, recovery_action: str) -> None:
+    """Record a task failure by bounded taxonomy class and recovery action.
+
+    Both labels come from fixed enums in the scheduler's failure taxonomy —
+    never raw error text.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    FAILURE_CLASSIFICATIONS_TOTAL.labels(
+        failure_class=failure_class, recovery_action=recovery_action
+    ).inc()
+
+
+def set_tool_health_states(states: dict[str, str]) -> None:
+    """Set the per-state tool count gauge from a {tool_name: state} map.
+
+    Only the four bounded states appear as labels; unknown/empty map zeroes
+    the gauges.  Tool names are never exposed as labels.
+    """
+    if not HAS_PROMETHEUS:
+        return
+    bounded = (
+        "unknown",
+        "healthy",
+        "degraded",
+        "unavailable",
+    )
+    counts = {s: 0 for s in bounded}
+    for state in states.values():
+        if state in counts:
+            counts[state] += 1
+    for state in bounded:
+        TOOL_HEALTH_STATES.labels(state=state).set(counts[state])

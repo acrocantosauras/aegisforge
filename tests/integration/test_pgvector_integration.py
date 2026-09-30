@@ -87,7 +87,12 @@ class TestPgVectorStore:
         )
         store.add(entries, organization_id=org)
         assert store.count(organization_id=org) == 2
-        assert store.count() >= 2
+        # SECURITY (fail-closed count): an unscoped count() must NOT reveal
+        # total chunk volume across tenants — it answers 0, mirroring the
+        # adversarial regression in tests/test_adversarial_security.py
+        # (test_cross_org_delete_and_count_fail_closed).
+        assert store.count() == 0
+        assert store.count("org-other") == 0
 
     def test_similarity_search_and_top_k(self, store, pg_session_factory):
         org = "org-it-2"

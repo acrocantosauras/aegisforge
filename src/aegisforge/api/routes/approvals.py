@@ -104,9 +104,10 @@ def get_approval(
     approval = service.get_approval(approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
-    # F14: Tenant isolation check
+    # F14: Tenant isolation — cross-tenant reads answer 404 (never 403) so
+    # the endpoint cannot be used to confirm another tenant's approval ids.
     if approval.organization_id and approval.organization_id != user.organization_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+        raise HTTPException(status_code=404, detail="Approval not found")
     return _to_read(approval)
 
 
@@ -118,20 +119,27 @@ def _authorize_and_decide(
     decision_fn: str,
     settings: Settings,
 ) -> ApprovalRead:
-    """Shared authorize → decide → resume flow for approve/reject."""
+    """Shared authorize → decide → resume flow for approve/reject.
+
+    Order matters (F14 no-oracle policy): existence and tenant isolation are
+    checked BEFORE the role gate, so a foreign approval answers 404 for every
+    attacker role — the 403 role error is only ever returned for an approval
+    the caller's tenant legitimately owns.
+    """
+    service = _get_approval_service(db, settings)
+    existing = service.get_approval(approval_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    # F14: Tenant isolation — cross-tenant decisions answer 404 so a
+    # privileged user in another tenant cannot confirm this approval exists.
+    if existing.organization_id and existing.organization_id != user.organization_id:
+        raise HTTPException(status_code=404, detail="Approval not found")
+
     if user.role not in ("admin", "manager"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admin or manager roles can approve requests",
         )
-
-    service = _get_approval_service(db, settings)
-    existing = service.get_approval(approval_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="Approval not found")
-    # F14: Tenant isolation check
-    if existing.organization_id and existing.organization_id != user.organization_id:
-        raise HTTPException(status_code=403, detail="Access denied")
 
     if decision_fn == "approve":
         result = service.approve(

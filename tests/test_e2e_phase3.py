@@ -108,8 +108,10 @@ def test_scenario_a_knowledge_question_rag() -> None:
             )
             for c, emb in zip(ingestion_result.chunks, embeddings)
         ]
-        store.add(entries, organization_id="org-e2e")
-        assert store.count("org-e2e") >= 1
+        # Owner-scoped seed (P0 fix): retrieval is org AND owner scoped,
+        # matching REST document authorization.
+        store.add(entries, organization_id="org-e2e", owner_id="user-e2e")
+        assert store.count("org-e2e", "user-e2e") >= 1
 
     # Step 4: Retrieval Service
     with tracer.span("retrieval"):
@@ -460,7 +462,9 @@ def test_full_pipeline_with_async_execution() -> None:
         )
         for c, emb in zip(ingestion.chunks, embeddings)
     ]
-    store.add(entries, organization_id="org-e2e")
+    # Owner-scoped seed (P0 fix): the workflow context below runs as
+    # user-e2e, so the seed must be owner-scoped to that user.
+    store.add(entries, organization_id="org-e2e", owner_id="user-e2e")
 
     # Set up async execution
     queue = InMemoryJobQueue()

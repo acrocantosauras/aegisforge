@@ -7,6 +7,7 @@ postgres redis). They are never part of the default unit test run.
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
 
 import pytest
 
@@ -23,10 +24,30 @@ PG_URL = os.environ.get(
     "AEGISFORGE_TEST_DATABASE_URL",
     "postgresql+psycopg://aegisforge:aegisforge@localhost:5432/aegisforge",
 )
-REDIS_URL = os.environ.get(
-    "AEGISFORGE_TEST_REDIS_URL",
-    "redis://localhost:6379/0",
-)
+
+
+def _resolve_test_redis_url() -> str:
+    """Resolve the Redis URL for integration tests without echoing secrets.
+
+    Precedence:
+    1. AEGISFORGE_TEST_REDIS_URL — explicit test override, used exactly as-is.
+    2. REDIS_URL — shared environment URL (as used by docker compose services).
+    3. REDIS_PASSWORD — build an authenticated localhost URL (URL-encoded).
+    4. Unauthenticated localhost fallback for plain local development Redis.
+    """
+    explicit = os.environ.get("AEGISFORGE_TEST_REDIS_URL", "")
+    if explicit:
+        return explicit
+    shared = os.environ.get("REDIS_URL", "")
+    if shared:
+        return shared
+    password = os.environ.get("REDIS_PASSWORD", "")
+    if password:
+        return f"redis://:{quote(password, safe='')}@localhost:6379/0"
+    return "redis://localhost:6379/0"
+
+
+REDIS_URL = _resolve_test_redis_url()
 
 
 @pytest.fixture(scope="session")

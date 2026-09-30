@@ -7,8 +7,10 @@ import { useAuth } from "@/lib/auth";
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/requests/new", label: "New Request" },
+  { href: "/history", label: "Execution History" },
   { href: "/documents", label: "Documents" },
   { href: "/approvals", label: "Approvals" },
+  { href: "/system", label: "System Health" },
   { href: "/logs", label: "Execution Logs" },
 ];
 

@@ -52,12 +52,19 @@ def execute_request_route(
     This triggers: validate → plan → execute → evaluate → complete/fail.
     Blocks until the workflow completes. Use for testing and internal use.
     """
-    # Tenant isolation: the request must belong to the caller's organization
+    # Tenant isolation + owner scoping: the request must belong to the
+    # caller's organization AND have been created by the caller.  Org check
+    # alone is insufficient while self-registration shares the default org.
+    # Missing/foreign request → 404 (never 403: no existence oracle).
     from aegisforge.db.models import RequestModel
 
     request = (
         db.query(RequestModel)
-        .filter(RequestModel.id == request_id, RequestModel.organization_id == user.organization_id)
+        .filter(
+            RequestModel.id == request_id,
+            RequestModel.organization_id == user.organization_id,
+            RequestModel.requested_by == user.id,
+        )
         .first()
     )
     if request is None:
@@ -73,11 +80,16 @@ def execute_request_route(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    except Exception as exc:
+    except Exception:
+        # Never echo raw exception text to the client — it can carry SQL,
+        # connection-string, or stack details.  Full detail goes to the log.
+        import logging
+
+        logging.getLogger(__name__).exception("Execution failed for request %s", request_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Execution failed: {exc}",
-        )
+            detail="Execution failed",
+        ) from None
 
     return result
 
@@ -106,10 +118,16 @@ def execute_request_async(
     )
     from aegisforge.db.models import ExecutionJobModel, RequestModel, WorkflowModel
 
-    # Verify request exists AND belongs to the caller's organization
+    # Verify request exists AND belongs to the caller (org + owner — the
+    # org check alone would let any user in the shared default org queue and
+    # observe execution of someone else's request).
     request_row = (
         db.query(RequestModel)
-        .filter(RequestModel.id == request_id, RequestModel.organization_id == user.organization_id)
+        .filter(
+            RequestModel.id == request_id,
+            RequestModel.organization_id == user.organization_id,
+            RequestModel.requested_by == user.id,
+        )
         .first()
     )
     if request_row is None:

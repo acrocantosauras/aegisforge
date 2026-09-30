@@ -156,12 +156,12 @@ class TestTenantIsolation:
         finally:
             db.close()
 
-        # Org B cannot read Org A's approval
+        # Org B cannot read Org A's approval — 404, never 403 (no oracle)
         resp = client.get(
             f"/api/v1/approvals/{approval.approval_id}",
             headers={"Authorization": f"Bearer {token_b}"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
 
 class TestSecrets:

@@ -27,16 +27,38 @@ from aegisforge.async_execution.jobs import (
 )
 from aegisforge.config import Settings, get_model_provider_from_settings, get_settings
 from aegisforge.db.session import get_session_factory
-from aegisforge.observability.metrics import set_active_workers
+from aegisforge.observability.metrics import set_active_claims, set_active_workers
 
 logger = logging.getLogger(__name__)
 
 # Graceful shutdown flag
 _shutdown_requested = False
 
-# Heartbeat interval for worker registry
-_WORKER_HEARTBEAT_INTERVAL = 30  # seconds
-_RECOVERY_SCAN_INTERVAL = 60  # seconds
+
+def _sanitize_redis_url(url: str) -> str:
+    """Strip credentials from a Redis URL for safe logging.
+
+    Redis URLs may embed credentials (redis://user:password@host:port/db).
+    Logging the raw URL would leak the password into logs; this renders the
+    credential portion as '***' while keeping the rest intact.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        if parts.username is None and parts.password is None:
+            return url
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        if parts.username is not None:
+            userinfo = "***"
+            if parts.password is not None:
+                userinfo = "***:***"
+            netloc = f"{userinfo}@{netloc}"
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        return "<unparseable-redis-url>"
 
 
 def _handle_signal(signum: int, frame: Any) -> None:
@@ -143,8 +165,24 @@ def _create_job_handler(settings: Settings) -> Any:
                 store=checkpoint_store,
             )
 
-            # Execute the workflow with all dependencies
+            # Execute the workflow with all dependencies.
+            # Phase 6D: When a job is a retry (crash recovery or stuck-job
+            # recovery), resume from the last durable checkpoint instead of
+            # restarting the workflow from scratch.  This preserves all work
+            # completed before the failure.
             from aegisforge.workflows.langgraph_workflow import execute_workflow
+
+            is_retry_resume = job.retry_count > 0
+            if is_retry_resume:
+                logger.info(
+                    "Job %s is retry #%d — resuming from checkpoint",
+                    job.job_id, job.retry_count,
+                )
+                try:
+                    from aegisforge.observability.metrics import record_workflow_checkpoint_resume
+                    record_workflow_checkpoint_resume()
+                except Exception:  # noqa: S110 — observability must never break execution
+                    pass
 
             final_state = execute_workflow(
                 request_id=job.request_id,
@@ -153,6 +191,7 @@ def _create_job_handler(settings: Settings) -> Any:
                 organization_id=organization_id,
                 workflow_id=job.workflow_id,
                 checkpointer=checkpointer,
+                resume_from_checkpoint=is_retry_resume,
                 model_provider=model_provider,
                 retrieval_service=retrieval_service,
                 approval_service=approval_service,
@@ -330,6 +369,19 @@ def _create_retrieval_service(settings: Settings) -> Any:
         return None
 
 
+def _build_stuck_job_config(settings: Settings) -> Any:
+    """Map Settings to StuckJobConfig so env config is actually respected."""
+    from aegisforge.async_execution.stuck_job_detector import StuckJobConfig
+
+    return StuckJobConfig(
+        enabled=settings.stuck_job_detection_enabled,
+        max_job_age_seconds=settings.stuck_job_max_age_seconds,
+        max_claim_age_seconds=settings.stuck_job_max_claim_age_seconds,
+        max_execution_time_seconds=settings.stuck_job_max_execution_time_seconds,
+        max_recoveries=settings.stuck_job_max_recoveries,
+    )
+
+
 def run_worker(settings: Settings | None = None) -> None:
     """Main worker loop.
 
@@ -349,7 +401,8 @@ def run_worker(settings: Settings | None = None) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
 
     logger.info("Starting AegisForge worker [%s]...", worker_id)
-    logger.info("Redis URL: %s", settings.redis_url)
+    # Phase 6G: never log raw Redis URLs — they may embed credentials.
+    logger.info("Redis URL: %s", _sanitize_redis_url(settings.redis_url))
 
     # F7: Create queue — fail clearly if Redis is unavailable in production
     is_production = settings.environment not in ("development", "test", "")
@@ -362,7 +415,9 @@ def run_worker(settings: Settings | None = None) -> None:
         redis_client = redis.from_url(settings.redis_url, decode_responses=True)
         redis_client.ping()
         queue = RedisJobQueue(redis_client)
-        logger.info("Connected to Redis at %s", settings.redis_url)
+        logger.info(
+            "Connected to Redis at %s", _sanitize_redis_url(settings.redis_url)
+        )
     except Exception as exc:
         if is_production:
             logger.critical(
@@ -383,7 +438,11 @@ def run_worker(settings: Settings | None = None) -> None:
     # Create job manager and worker
     job_manager = JobManager(queue)
     handler = _create_job_handler(settings)
-    job_worker = JobWorker(job_manager, handler, worker_id=worker_id)
+    # Phase 6G: advertise capacity so claim-time admission reflects what this
+    # worker loop can actually run (one job at a time per loop).
+    job_worker = JobWorker(
+        job_manager, handler, worker_id=worker_id, capacity=max(1, settings.worker_capacity)
+    )
 
     # Phase 6B: Register worker in Redis registry
     job_worker.register_in_registry()
@@ -391,19 +450,47 @@ def run_worker(settings: Settings | None = None) -> None:
 
     # Phase 6B: Start heartbeat thread
     def _heartbeat_loop() -> None:
+        from aegisforge.observability.metrics import set_worker_capacity
+
         while not _shutdown_requested:
             try:
                 # Refresh job heartbeat if processing
                 job_worker.send_heartbeat()
-                # Refresh worker registry heartbeat
+                # Refresh worker registry heartbeat (also re-advertises capacity)
                 job_worker.refresh_registry()
                 # Update active workers metric
                 if isinstance(queue, RedisJobQueue):
                     active = queue.get_active_workers()
                     set_active_workers(len(active))
+                    # Phase 6G boundedness: sweep dead worker registrations
+                    # (crashed workers must not accumulate in the registry,
+                    # capacity, or active-job hashes forever).
+                    try:
+                        queue.cleanup_dead_worker_state()
+                    except Exception:  # noqa: S110 — cleanup is best-effort
+                        pass
+                    # Update active claims metric
+                    try:
+                        import time as _time
+
+                        now = _time.time()
+                        active_claims = queue._redis.zrangebyscore(
+                            "aegisforge:active_claims", str(now), "+inf"
+                        )
+                        set_active_claims(len(active_claims))
+                    except Exception:  # noqa: S110
+                        pass
+                    # Phase 6G: capacity utilization gauges (bounded)
+                    try:
+                        active_jobs = queue.get_worker_active_jobs(worker_id)
+                        set_worker_capacity(
+                            max(1, settings.worker_capacity), active_jobs
+                        )
+                    except Exception:  # noqa: S110
+                        pass
             except Exception:  # noqa: S110 — observability must never break execution
                 pass
-            time.sleep(_WORKER_HEARTBEAT_INTERVAL)
+            time.sleep(max(1, settings.worker_heartbeat_interval_seconds))
 
     heartbeat_thread = threading.Thread(
         target=_heartbeat_loop, daemon=True, name=f"heartbeat-{worker_id}"
@@ -411,10 +498,21 @@ def run_worker(settings: Settings | None = None) -> None:
     heartbeat_thread.start()
 
     # Phase 6B: Start recovery scan thread
+    # Phase 6C: Also run stuck-job detection (wired from Settings so that
+    # STUCK_JOB_* environment variables are actually respected)
     def _recovery_loop() -> None:
+        stuck_detector = None
+        if isinstance(queue, RedisJobQueue):
+            from aegisforge.async_execution.stuck_job_detector import StuckJobDetector
+
+            stuck_detector = StuckJobDetector(
+                redis_client=queue._redis,
+                config=_build_stuck_job_config(settings),
+            )
+
         while not _shutdown_requested:
             try:
-                time.sleep(_RECOVERY_SCAN_INTERVAL)
+                time.sleep(max(1, settings.worker_recovery_scan_interval_seconds))
                 if _shutdown_requested:
                     break
                 recovered = job_worker.recover_expired_jobs()
@@ -423,6 +521,29 @@ def run_worker(settings: Settings | None = None) -> None:
                         "Worker [%s] recovered %d expired job(s): %s",
                         worker_id, len(recovered), recovered,
                     )
+
+                # Phase 6C: Stuck job detection
+                if stuck_detector is not None:
+                    from aegisforge.observability.metrics import (
+                        record_stuck_job_detected,
+                        record_stuck_job_recovered,
+                    )
+
+                    stuck_jobs = stuck_detector.scan_for_stuck_jobs()
+                    for stuck_info in stuck_jobs:
+                        record_stuck_job_detected()
+                        logger.warning(
+                            "Stuck job detected [%s]: %s",
+                            stuck_info.job_id,
+                            stuck_info.reason,
+                        )
+                        if stuck_detector.recover_stuck_job(stuck_info):
+                            record_stuck_job_recovered()
+                            logger.info(
+                                "Worker [%s] recovered stuck job %s",
+                                worker_id,
+                                stuck_info.job_id,
+                            )
             except Exception:  # noqa: S110 — observability must never break execution
                 pass
 

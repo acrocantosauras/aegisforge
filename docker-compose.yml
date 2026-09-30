@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -22,11 +20,19 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    command: ["redis-server", "--appendonly", "yes"]
+    # Password-authenticated Redis. An unauthenticated Redis on a published
+    # port is a P1 exposure (config/execution surface). Override the default
+    # via REDIS_PASSWORD in production; the default keeps local dev working.
+    command:
+      ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-aegisforge-dev-redis-password}"]
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a \"$${REDIS_PASSWORD:-aegisforge-dev-redis-password}\" ping | grep -q PONG",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -43,12 +49,12 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@postgres:5432/aegisforge
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-aegisforge-dev-redis-password}@redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      LLM_PROVIDER: deterministic
-      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
       EMBEDDING_DIMENSION: "384"
-      ENVIRONMENT: development
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,19 +74,25 @@ services:
     command: python -m aegisforge.worker
     environment:
       DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@postgres:5432/aegisforge
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-aegisforge-dev-redis-password}@redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      LLM_PROVIDER: deterministic
-      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
       EMBEDDING_DIMENSION: "384"
-      ENVIRONMENT: development
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; r=redis.from_url('redis://redis:6379/0'); r.ping()"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os; import redis; r=redis.from_url(os.environ['REDIS_URL']); r.ping()",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -93,19 +105,25 @@ services:
     command: python -m aegisforge.worker
     environment:
       DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@postgres:5432/aegisforge
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-aegisforge-dev-redis-password}@redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      LLM_PROVIDER: deterministic
-      EMBEDDING_PROVIDER: deterministic
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
       EMBEDDING_DIMENSION: "384"
-      ENVIRONMENT: development
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import redis; r=redis.from_url('redis://redis:6379/0'); r.ping()"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os; import redis; r=redis.from_url(os.environ['REDIS_URL']); r.ping()",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -114,11 +132,15 @@ services:
   frontend:
     image: node:20-alpine
     working_dir: /frontend
-    command: sh -c "npm install && npm run dev"
+    # Production runtime: install locked deps, build once, serve the
+    # production server (NOT `next dev`).  Rebuilds on container start
+    # so the running frontend always matches the mounted working tree.
+    command: sh -c "npm ci && npm run build && npm run start"
     ports:
       - "3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: production
     volumes:
       - ./frontend:/frontend
     depends_on:
@@ -144,6 +166,7 @@ services:
       - "9090:9090"
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./observability/alert-rules.yml:/etc/prometheus/alert-rules.yml
       - prometheus_data:/prometheus
     depends_on:
       - otel-collector

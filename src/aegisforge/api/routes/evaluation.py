@@ -64,7 +64,23 @@ def get_execution_metrics(
     db: Session = Depends(get_db),
     user: UserModel = Depends(get_current_user),
 ) -> ExecutionMetricsRead | None:
-    """Get execution metrics for a specific request."""
+    """Get execution metrics for a specific request.
+
+    SECURITY: metrics are keyed by request id and may reveal that a request
+    exists plus its execution fingerprint.  Unknown id, foreign request, and
+    unauthorized request all return ``null`` — indistinguishable, so the
+    endpoint is not an existence oracle.
+    """
+    from aegisforge.db.models import RequestModel
+
+    request = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+    if (
+        request is None
+        or request.organization_id != user.organization_id
+        or request.requested_by != user.id
+    ):
+        return None
+
     collector = get_metrics_collector()
     metrics = collector.get(request_id)
     if metrics is None:

@@ -59,6 +59,9 @@ jobs:
       - name: Frontend tests
         run: npm test
 
+      - name: Frontend production build
+        run: npm run build
+
   integration-postgres:
     runs-on: ubuntu-latest
     services:
@@ -99,9 +102,10 @@ jobs:
           DATABASE_URL: postgresql+psycopg://aegisforge:aegisforge@localhost:5432/aegisforge
         run: |
           python -c "
+          import os
           from sqlalchemy import text
           from aegisforge.db.session import get_engine
-          engine = get_engine()
+          engine = get_engine(os.environ['DATABASE_URL'])
           with engine.connect() as conn:
               result = conn.execute(text(\"SELECT extname FROM pg_extension WHERE extname = 'vector'\"))
               row = result.fetchone()
@@ -193,6 +197,16 @@ jobs:
 
   docker-build:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -212,7 +226,10 @@ jobs:
             -p 8001:8000 \
             aegisforge:test
           sleep 5
+          # Readiness must pass too: /ready verifies DB+Redis connectivity,
+          # so it also catches a broken Redis URL / auth wiring in the image.
           curl -sf http://localhost:8001/api/v1/health || (docker logs aegisforge-test && exit 1)
+          curl -sf http://localhost:8001/api/v1/ready || (docker logs aegisforge-test && exit 1)
           docker stop aegisforge-test
           docker rm aegisforge-test
 
@@ -252,9 +269,10 @@ jobs:
         run: |
           echo "=== Tables before migration ==="
           python -c "
+          import os
           from sqlalchemy import text
           from aegisforge.db.session import get_engine
-          engine = get_engine()
+          engine = get_engine(os.environ['DATABASE_URL'])
           with engine.connect() as conn:
               result = conn.execute(text(\"SELECT count(*) FROM information_schema.tables WHERE table_schema='public'\"))
               print(f'Tables before: {result.scalar()}')
@@ -262,9 +280,10 @@ jobs:
           alembic upgrade head
           echo "=== Tables after migration ==="
           python -c "
+          import os
           from sqlalchemy import text
           from aegisforge.db.session import get_engine
-          engine = get_engine()
+          engine = get_engine(os.environ['DATABASE_URL'])
           with engine.connect() as conn:
               result = conn.execute(text(\"SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename\"))
               for row in result:

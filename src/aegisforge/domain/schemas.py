@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -36,6 +37,7 @@ class RequestRead(BaseModel):
     intent: str
     status: RequestStatus
     context: Any = Field(default_factory=dict)
+    created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
 

@@ -73,14 +73,21 @@ export class ApiClient {
   }
 
   // Auth
+  /** Create the account, then log in to obtain the session token.
+   *
+   * The backend register endpoint returns the created user (201), not a
+   * token — authentication requires a separate /auth/login call.
+   */
   async register(email: string, password: string, fullName: string) {
-    return this.request<{
-      access_token: string;
-      token_type: string;
+    const user = await this.request<{
+      id: string;
+      email: string;
+      full_name: string;
     }>("/auth/register", {
       method: "POST",
       body: { email, password, full_name: fullName },
     });
+    return this.login(email, password);
   }
 
   async login(email: string, password: string) {
@@ -112,6 +119,11 @@ export class ApiClient {
     >("/requests", { token });
   }
 
+  /** Execution history: this user's requests, newest first. */
+  async getRequestHistory(token: string) {
+    return this.request<RequestHistoryItem[]>("/requests", { token });
+  }
+
   async getRequest(id: string, token: string) {
     return this.request<{
       id: string;
@@ -131,6 +143,58 @@ export class ApiClient {
       final_result: Record<string, unknown>;
       errors: string[];
     }>(`/execution/requests/${requestId}/execute`, { method: "POST", token });
+  }
+
+  /** Submit a job to the distributed worker queue (202 + job_id). */
+  async executeRequestAsync(requestId: string, token: string) {
+    return this.request<{
+      request_id: string;
+      workflow_id: string;
+      job_id: string;
+      status: string;
+      message: string;
+    }>(`/execution/requests/${requestId}/execute-async`, {
+      method: "POST",
+      token,
+    });
+  }
+
+  // Workflows
+  /** Resolve the latest workflow for a request (tenant + owner scoped). */
+  async getWorkflowByRequest(requestId: string, token: string) {
+    return this.request<{
+      request_id: string;
+      workflow_id: string;
+      status: string;
+    }>(`/workflows/by-request/${requestId}`, { token });
+  }
+
+  async getWorkflowTasks(workflowId: string, token: string) {
+    return this.request<{
+      workflow_id: string;
+      request_id: string;
+      status: string;
+      tasks: WorkflowTask[];
+    }>(`/workflows/${workflowId}/tasks`, { token });
+  }
+
+  async getWorkflowGraph(workflowId: string, token: string) {
+    return this.request<WorkflowGraph>(`/workflows/${workflowId}`, { token });
+  }
+
+  async getWorkflowEvaluation(workflowId: string, token: string) {
+    return this.request<{
+      workflow_id: string;
+      request_id: string;
+      evaluation: WorkflowEvaluation;
+    }>(`/workflows/${workflowId}/evaluations`, { token });
+  }
+
+  /** Final synthesized result: answer, citations, evidence, tools. */
+  async getWorkflowResult(workflowId: string, token: string) {
+    return this.request<WorkflowResult>(`/workflows/${workflowId}/result`, {
+      token,
+    });
   }
 
   // Documents
@@ -245,6 +309,102 @@ export class ApiClient {
   async healthCheck() {
     return this.request<{ status: string }>("/health");
   }
+
+  /** Real component status: database, Redis, workers, queue depth. */
+  async systemStatus() {
+    return this.request<SystemStatus>("/system");
+  }
+}
+
+export interface WorkflowTask {
+  task_id: string;
+  description: string;
+  agent_type: string;
+  dependencies: string[];
+  status: string;
+  retries: number;
+  duration_ms: number | null;
+  summary: string;
+  errors: string[];
+  approval_required: boolean;
+  tools_used: string[];
+  evidence_count: number;
+}
+
+export interface WorkflowGraph {
+  workflow_id: string;
+  request_id: string;
+  status: string;
+  nodes: { task_id: string; agent_type: string; status: string }[];
+  edges: { from: string; to: string }[];
+}
+
+export interface WorkflowEvaluation {
+  planning?: {
+    task_count?: number;
+    parallel_waves?: number;
+    max_parallelism?: number;
+    score?: number;
+  };
+  collaboration?: {
+    total_tasks?: number;
+    tasks_with_references?: number;
+    references_resolved?: number;
+    references_failed?: number;
+    information_passed_ratio?: number;
+    score?: number;
+  };
+  final_response?: {
+    produced?: boolean;
+    grounded?: boolean;
+    citation_count?: number;
+    complete?: boolean;
+    failed_upstream_count?: number;
+    score?: number;
+  };
+  overall_score?: number;
+}
+
+export interface WorkflowResult {
+  workflow_id: string;
+  request_id: string;
+  status: string;
+  agent_type: string;
+  answer: string;
+  summary: string;
+  citations: Record<string, unknown>[];
+  evidence: Record<string, unknown>[];
+  tools_used: string[];
+  confidence: number | null;
+  failed_upstream: string[];
+  errors: string[];
+}
+
+export interface RequestHistoryItem {
+  id: string;
+  intent: string;
+  status: string;
+  created_at: string;
+}
+
+export interface SystemStatus {
+  status: string;
+  components: {
+    api: string;
+    database: string;
+    redis: string;
+    workers: {
+      status: string;
+      active: number;
+      healthy: number;
+      list: {
+        worker_id: string;
+        last_heartbeat_age_seconds: number;
+        healthy: boolean;
+      }[];
+    };
+    queue: { status: string; depth: number };
+  };
 }
 
 export const apiClient = new ApiClient();

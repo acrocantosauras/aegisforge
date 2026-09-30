@@ -3,11 +3,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import NewRequestPage from "@/app/requests/new/page";
 
-const { pushMock, backMock, createRequestMock, executeRequestMock } = vi.hoisted(() => ({
+const { pushMock, backMock, createRequestMock, executeRequestMock, executeAsyncMock } = vi.hoisted(() => ({
   pushMock: vi.fn(),
   backMock: vi.fn(),
   createRequestMock: vi.fn(),
   executeRequestMock: vi.fn(),
+  executeAsyncMock: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({
@@ -30,6 +31,7 @@ vi.mock("@/lib/api", () => ({
   apiClient: {
     createRequest: createRequestMock,
     executeRequest: executeRequestMock,
+    executeRequestAsync: executeAsyncMock,
   },
 }));
 
@@ -39,13 +41,16 @@ describe("NewRequestPage", () => {
     backMock.mockReset();
     createRequestMock.mockReset();
     executeRequestMock.mockReset();
+    executeAsyncMock.mockReset();
+    // Default: async submission succeeds.
+    executeAsyncMock.mockResolvedValue({ status: "queued" });
   });
 
   it("disables submit until the intent is long enough", async () => {
     const user = userEvent.setup();
     render(<NewRequestPage />);
 
-    const submit = screen.getByRole("button", { name: "Submit Request" });
+    const submit = screen.getByRole("button", { name: "Submit & Execute" });
     expect(submit).toBeDisabled();
 
     await user.type(screen.getByLabelText("Task Description"), "short");
@@ -55,9 +60,8 @@ describe("NewRequestPage", () => {
     expect(submit).toBeEnabled();
   });
 
-  it("creates the request, auto-executes, and navigates to the detail page", async () => {
+  it("creates the request, submits via async queue, and navigates to the detail page", async () => {
     createRequestMock.mockResolvedValue({ id: "req-new-1", status: "created" });
-    executeRequestMock.mockResolvedValue({ status: "queued" });
     const user = userEvent.setup();
     render(<NewRequestPage />);
 
@@ -65,7 +69,7 @@ describe("NewRequestPage", () => {
       screen.getByLabelText("Task Description"),
       "Research latest AI frameworks and summarize"
     );
-    await user.click(screen.getByRole("button", { name: "Submit Request" }));
+    await user.click(screen.getByRole("button", { name: "Submit & Execute" }));
 
     await waitFor(() => {
       expect(createRequestMock).toHaveBeenCalledWith(
@@ -73,13 +77,33 @@ describe("NewRequestPage", () => {
         {},
         "tok"
       );
-      expect(executeRequestMock).toHaveBeenCalledWith("req-new-1", "tok");
+      expect(executeAsyncMock).toHaveBeenCalledWith("req-new-1", "tok");
       expect(pushMock).toHaveBeenCalledWith("/requests/req-new-1");
+    });
+  });
+
+  it("falls back to sync execution when the async queue rejects", async () => {
+    createRequestMock.mockResolvedValue({ id: "req-new-3", status: "created" });
+    executeAsyncMock.mockRejectedValue(new Error("queue unavailable"));
+    executeRequestMock.mockResolvedValue({ status: "completed" });
+    const user = userEvent.setup();
+    render(<NewRequestPage />);
+
+    await user.type(
+      screen.getByLabelText("Task Description"),
+      "Research incident response policy and summarize"
+    );
+    await user.click(screen.getByRole("button", { name: "Submit & Execute" }));
+
+    await waitFor(() => {
+      expect(executeRequestMock).toHaveBeenCalledWith("req-new-3", "tok");
+      expect(pushMock).toHaveBeenCalledWith("/requests/req-new-3");
     });
   });
 
   it("still navigates when auto-execution fails", async () => {
     createRequestMock.mockResolvedValue({ id: "req-new-2", status: "created" });
+    executeAsyncMock.mockRejectedValue(new Error("queue unavailable"));
     executeRequestMock.mockRejectedValue(new Error("worker busy"));
     const user = userEvent.setup();
     render(<NewRequestPage />);
@@ -88,7 +112,7 @@ describe("NewRequestPage", () => {
       screen.getByLabelText("Task Description"),
       "Analyze market trends for Q3 planning"
     );
-    await user.click(screen.getByRole("button", { name: "Submit Request" }));
+    await user.click(screen.getByRole("button", { name: "Submit & Execute" }));
 
     await waitFor(() => {
       expect(pushMock).toHaveBeenCalledWith("/requests/req-new-2");
@@ -104,7 +128,7 @@ describe("NewRequestPage", () => {
       screen.getByLabelText("Task Description"),
       "A task that will fail to be created"
     );
-    await user.click(screen.getByRole("button", { name: "Submit Request" }));
+    await user.click(screen.getByRole("button", { name: "Submit & Execute" }));
 
     await waitFor(() => {
       expect(screen.getByText("Request validation failed")).toBeInTheDocument();

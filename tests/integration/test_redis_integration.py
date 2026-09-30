@@ -133,6 +133,7 @@ class TestWorkerProductionBehavior:
         settings = Settings(
             environment="production",
             redis_url="redis://localhost:6399/0",  # nothing listens here
+            secret_key="integration-production-secret-0123456789abcdef",
         )
         monkeypatch.setattr("sys.argv", ["worker"])
         with pytest.raises(SystemExit) as excinfo:
@@ -162,6 +163,7 @@ class TestWorkerProductionBehavior:
         settings = Settings(
             environment="production",
             redis_url="redis://localhost:6379/0",
+            secret_key="integration-production-secret-0123456789abcdef",
         )
 
         # Capture the queue built inside run_worker by intercepting JobManager
