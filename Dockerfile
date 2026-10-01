@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir .
 # Copy remaining application files
 COPY alembic/ alembic/
 COPY alembic.ini ./
+COPY docker/migrate.sh /app/docker/migrate.sh
+RUN chmod +x /app/docker/migrate.sh
 
 # Create a non-root user and switch to it
 RUN groupadd -r aegisforge && useradd --no-log-init -r -g aegisforge aegisforge \

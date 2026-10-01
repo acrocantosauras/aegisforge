@@ -1,0 +1,178 @@
+# Production-equivalent deployment stack (Phase 9).
+#
+# Differences from docker-compose.yml (development):
+#   - Postgres/Redis are NOT published to the host (internal network only).
+#   - Frontend runs the deterministic production image (Dockerfile.frontend),
+#     not a source mount rebuilt at container start.
+#   - Exactly one service (api-migrate) runs `alembic upgrade head`; workers
+#     start only after the API reports ready, so migrations never race.
+#   - Caddy terminates HTTPS and reverse-proxies to API + frontend.
+#   - All secrets come from the environment (see .env.example).
+#
+# Usage:
+#   cp .env.example .env   # then set real values
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# External dependencies option: instead of the bundled postgres/redis
+# services, set DATABASE_URL / REDIS_URL to managed providers (e.g. a
+# managed Postgres+pgvector and an authenticated managed Redis) and start
+# only: api-migrate, api, worker-1, worker-2, frontend, caddy.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aegisforge}
+      POSTGRES_USER: ${POSTGRES_USER:-aegisforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-aegisforge} -d $${POSTGRES_DB:-aegisforge}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    # No ports: reachable only from the internal compose network.
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command:
+      ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is required}"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    # No ports: reachable only from the internal compose network.
+
+  api-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sh /app/docker/migrate.sh true
+    environment: &api_env
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://aegisforge:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/aegisforge}
+      REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required (python -c "import secrets; print(secrets.token_urlsafe(48))")}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEBUG: ${DEBUG:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required (frontend origin, e.g. https://app.example.com)}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      sh -c "uvicorn aegisforge.app:app --host 0.0.0.0 --port 8000"
+    ports:
+      # Host-side override for coexistence/testing; behind Caddy only 80/443 are public.
+      - "${API_PORT:-8000}:8000"
+    environment: *api_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  worker-1: &worker
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m aegisforge.worker
+    environment: *api_env
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os; import redis; r=redis.from_url(os.environ['REDIS_URL']); r.ping()",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  worker-2:
+    <<: *worker
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        # Baked into the client bundle at build time; must be the
+        # browser-reachable API origin (the Caddy HTTPS URL).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required (e.g. https://api.example.com)}
+    environment:
+      NODE_ENV: production
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN is required (e.g. api.example.com)}
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required (e.g. app.example.com)}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required for Let's Encrypt}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

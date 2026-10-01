@@ -593,6 +593,23 @@ def set_active_workers(count: int) -> None:
     ACTIVE_WORKERS.set(count)
 
 
+def refresh_worker_queue_gauges(
+    worker_count: int, claim_count: int, queue_depth_count: int
+) -> None:
+    """Refresh process-independent gauges from authoritative Redis state.
+
+    Workers set these gauges in their own process, which Prometheus cannot
+    see. The API calls this on every /metrics scrape so alert rules such as
+    ``NoHealthyWorkers`` and ``QueueGrowthSustained`` evaluate against real
+    values. Callers must tolerate Redis failures (gauges keep last value).
+    """
+    if not HAS_PROMETHEUS:
+        return
+    ACTIVE_WORKERS.set(max(worker_count, 0))
+    ACTIVE_CLAIMS.set(max(claim_count, 0))
+    QUEUE_DEPTH.set(max(queue_depth_count, 0))
+
+
 def record_job_recovered() -> None:
     """Record a job recovery event."""
     if not HAS_PROMETHEUS:

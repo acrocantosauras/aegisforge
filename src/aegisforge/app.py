@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -120,6 +122,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Prometheus metrics endpoint
     @app.get("/metrics")
     def metrics() -> Response:
+        # Workers export gauges in their own process, invisible to Prometheus.
+        # Refresh from authoritative Redis state so queue/worker alerts work.
+        if HAS_PROMETHEUS:
+            try:
+                import time as _time
+
+                import redis as redis_lib
+
+                from aegisforge.observability.metrics import refresh_worker_queue_gauges
+
+                client = redis_lib.from_url(settings.redis_url, decode_responses=True)
+                client.ping()
+                now = _time.time()
+                worker_count = len(
+                    client.zrangebyscore("aegisforge:workers", now - 120, "+inf")
+                )
+                claim_count = len(
+                    client.zrangebyscore("aegisforge:active_claims", now, "+inf")
+                )
+                queue_depth_count = int(client.llen("aegisforge:jobs") or 0)
+                refresh_worker_queue_gauges(worker_count, claim_count, queue_depth_count)
+            except Exception:  # metrics must never fail the scrape
+                logging.getLogger(__name__).debug(
+                    "Metrics gauge refresh from Redis failed", exc_info=True
+                )
         return Response(
             content=get_metrics(),
             media_type=get_metrics_content_type(),

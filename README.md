@@ -310,6 +310,21 @@ docker compose up --build
 
 This starts: API, Worker, PostgreSQL, Redis, Frontend, OTel Collector, Prometheus, Grafana.
 
+### Production Deployment
+
+The production stack (single migration runner, internal-only Postgres/Redis,
+standalone frontend image, Caddy HTTPS) lives in `docker-compose.prod.yml`:
+
+```bash
+cp .env.example .env   # set real values (SECRET_KEY, passwords, domains)
+./scripts/deploy.sh check
+./scripts/deploy.sh up
+```
+
+See `docs/phase9-deployment.md` for architecture, managed-service options,
+and the exact manual deployment steps, and `docs/deployment-checklist.md`
+for verified readiness status.
+
 ### Environment Variables
 
 Copy `.env.example` to `.env` and configure:

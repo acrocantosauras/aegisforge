@@ -1,0 +1,15 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# HTTPS is automatic (Let's Encrypt) for public DNS names.
+# For local production-equivalent testing without public DNS, replace the
+# site addresses below with :443 and add `tls internal` to both blocks.
+
+{$API_DOMAIN} {
+	reverse_proxy api:8000
+}
+
+{$APP_DOMAIN} {
+	reverse_proxy frontend:3000
+}

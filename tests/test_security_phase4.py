@@ -178,7 +178,9 @@ class TestSecretHandling:
         """Default config should not contain production secrets."""
         from aegisforge.config import Settings
 
-        settings = Settings()
+        # _env_file=None: ignore any local .env so we assert code defaults,
+        # not developer-machine overrides.
+        settings = Settings(_env_file=None)
         assert settings.secret_key != ""  # Has a value
         assert "dev" in settings.secret_key or "change" in settings.secret_key  # But it's a dev default
         assert settings.llm_api_key == ""  # No API key by default

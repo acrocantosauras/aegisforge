@@ -62,6 +62,54 @@ jobs:
       - name: Frontend production build
         run: npm run build
 
+  docker-images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: aegisforge-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.frontend
+          push: false
+          load: true
+          tags: aegisforge-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://localhost:8000
+
+      - name: Smoke test backend image
+        run: |
+          docker run -d --name api-smoke \
+            -e ENVIRONMENT=development \
+            -e DATABASE_URL=sqlite:///./aegisforge.db \
+            aegisforge-backend:ci \
+            uvicorn aegisforge.app:app --host 0.0.0.0 --port 8000
+          for i in $(seq 1 30); do
+            if docker exec api-smoke python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" 2>/dev/null; then
+              echo "API healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed to become healthy"; exit 1
+
   integration-postgres:
     runs-on: ubuntu-latest
     services:

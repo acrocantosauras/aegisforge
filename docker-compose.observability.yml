@@ -1,0 +1,45 @@
+# Observability overlay for the production stack (Phase 9).
+# Attach with:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.observability.yml up -d
+#
+# Metrics path: API /metrics and worker OTLP -> otel-collector -> Prometheus.
+# All services are internal-only; access via SSH tunnel, e.g.:
+#   ssh -L 9090:localhost:9090 host   # then scrape-forward as needed
+# or expose selectively behind Caddy with authentication (not done by default).
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    restart: unless-stopped
+    # No ports: reachable only from the internal compose network.
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+    # No ports: query via SSH tunnel or an authenticated proxy.
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+    volumes:
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    # No ports by default: expose via Caddy with auth if desired.
+
+volumes:
+  prometheus_data:
+  grafana_data:
