@@ -879,7 +879,7 @@ export default function RequestDetailPage() {
           {hasEval && (
             <div className="card" style={{ marginBottom: 16 }}>
               <div className="card-header">
-                <h2>Evaluation</h2>
+                <h2>Workflow Evaluation</h2>
                 <span className="t-caption mono">
                   overall{" "}
                   {typeof evaluation!.overall_score === "number"
@@ -887,6 +887,10 @@ export default function RequestDetailPage() {
                     : "—"}
                 </span>
               </div>
+              <p className="t-caption" style={{ marginTop: 4, marginBottom: 10 }}>
+                Workflow-level quality (planning / collaboration / final response), measured from the
+                run records — not the per-task verdict that drives retries.
+              </p>
               <div className="eval-grid">
                 {[
                   {
