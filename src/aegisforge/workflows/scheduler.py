@@ -221,13 +221,74 @@ def _pick_path(source: dict[str, Any], path: str) -> Any:
     return current
 
 
+def _evidence_items_from(record: Any, dep_id: str) -> list[dict[str, Any]]:
+    """Expand one completed dependency into evidence items for analysis.
+
+    A dependency that produced *structured, per-source evidence* (a RAG
+    citation, a tool result) contributes one item per source, each carrying its
+    own provenance and the retriever's relevance score.  Analysis agents then
+    reason over individual sources, which is what makes source-level conflict
+    detection meaningful instead of comparing two opaque blobs.
+
+    Dependencies without structured evidence (a summary-only task) contribute a
+    single item built from their answer, preserving the previous behaviour.
+    """
+    base: dict[str, Any] = {
+        "task_id": dep_id,
+        "agent": record.agent_type,
+    }
+
+    items: list[dict[str, Any]] = []
+    for entry in record.evidence or []:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content") or entry.get("snippet") or entry.get("summary")
+        if not content or not str(content).strip():
+            continue
+        item = {
+            **base,
+            "content": str(content),
+            "summary": str(entry.get("summary", "") or "") or None,
+            "source": str(
+                entry.get("source")
+                or entry.get("document_id")
+                or entry.get("chunk_id")
+                or record.task_id
+            ),
+            "chunk_id": str(entry.get("chunk_id", "") or ""),
+        }
+        # Prefer the retriever/tool's own relevance score over the analysis
+        # agent's crude token-overlap heuristic when one was reported.
+        score = entry.get("score", entry.get("relevance"))
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            item["relevance"] = float(score)
+        items.append(item)
+
+    if items:
+        return items
+
+    return [
+        {
+            **base,
+            "content": record.output.get("answer", record.summary),
+            "summary": record.summary,
+            "source": _pick_path(record.output, "source")
+            or _pick_path(record.output, "query")
+            or record.task_id,
+        }
+    ]
+
+
 class TaskInputResolver:
     """Resolves a task's effective input from completed dependency outputs.
 
     Two special input fields are supported for inter-agent data passing:
 
     - ``evidence_from: [dep_task_id, ...]`` — expands each completed
-      dependency's result into an evidence item (content + source + task_id).
+      dependency's result into evidence items (content + source + task_id).
+      Dependencies that produced per-source evidence (e.g. RAG citations)
+      contribute one item per source so analysis can detect conflicts between
+      individual sources; summary-only dependencies contribute one item.
     - ``agent_outputs_from: [dep_task_id, ...]`` — expands completed dependency
       records into serialized agent-output views for the synthesis agent.
 
@@ -275,17 +336,7 @@ class TaskInputResolver:
                 if record is None or record.status != AgentExecutionStatus.COMPLETED:
                     warnings.append(f"Evidence task '{dep_id}' did not complete")
                     continue
-                evidence.append(
-                    {
-                        "content": record.output.get("answer", record.summary),
-                        "summary": record.summary,
-                        "source": _pick_path(record.output, "source")
-                        or _pick_path(record.output, "query")
-                        or record.task_id,
-                        "task_id": dep_id,
-                        "agent": record.agent_type,
-                    }
-                )
+                evidence.extend(_evidence_items_from(record, dep_id))
             input_data["evidence"] = evidence
 
         agent_outputs_from = input_data.pop("agent_outputs_from", None)

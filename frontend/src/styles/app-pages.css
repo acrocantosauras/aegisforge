@@ -195,6 +195,17 @@
   color: var(--fg-muted);
 }
 
+/* The flagship scenario is the documented demo entry point: give it a
+   deliberate accent so it reads as the recommended starting point. */
+.intent-example.flagship {
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+}
+
+.intent-example.flagship .label {
+  color: var(--accent);
+}
+
 /* ---------- Execution workspace header ---------- */
 
 .exec-header {

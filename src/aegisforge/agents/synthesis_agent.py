@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from aegisforge.agents.analysis_agent import evidence_polarity
 from aegisforge.agents.base import AgentExecutionContext, BaseAgent, PermissionSpec
 from aegisforge.domain.models import AgentExecutionStatus, AgentResult, AgentType
 from aegisforge.evaluation.evidence import (
@@ -163,6 +164,19 @@ def synthesize_results(
     if evidence_summary_parts:
         answer += "\n\n--- Evidence Assessment ---\n" + "\n".join(evidence_summary_parts)
 
+    # ---- Phase 5.3F: Rank citations by evidence quality ----
+    ranked_citations = _rank_citations(all_citations, evidence_items)
+
+    # ---- Structured decision sections, derived only from measured run data ----
+    structured = _build_report_sections(
+        succeeded=succeeded,
+        ranked_citations=ranked_citations,
+        evidence_assessment=evidence_assessment,
+        contradictions=contradictions,
+    )
+    if structured:
+        answer += "\n\n" + structured
+
     if not complete:
         answer += (
             "\n\nCoverage warning: the response above is partial — the following "
@@ -170,9 +184,6 @@ def synthesize_results(
             + ", ".join(f"{f['agent']} ({f['task_id']})" for f in failed)
             + "."
         )
-
-    # ---- Phase 5.3F: Rank citations by evidence quality ----
-    ranked_citations = _rank_citations(all_citations, evidence_items)
 
     evidence_count = len(evidence_seen)
     # Confidence: derived from evidence quality + completeness + contradiction count
@@ -203,6 +214,140 @@ def synthesize_results(
     }
 
 
+def _collect_analysis_findings(
+    succeeded: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collect findings produced by analysis agents in this run."""
+    findings: list[dict[str, Any]] = []
+    for out in succeeded:
+        result = out.get("result") or out.get("output") or {}
+        if not isinstance(result, dict):
+            continue
+        agent = str(out.get("agent", out.get("agent_name", out.get("agent_type", ""))))
+        if "analysis" not in agent.lower():
+            continue
+        for finding in result.get("findings", []) or []:
+            if isinstance(finding, dict) and finding.get("content"):
+                findings.append(finding)
+    return findings
+
+
+def _collect_analysis_conflicts(succeeded: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect conflicts the analysis stage detected between individual sources."""
+    conflicts: list[dict[str, Any]] = []
+    for out in succeeded:
+        result = out.get("result") or out.get("output") or {}
+        if not isinstance(result, dict):
+            continue
+        agent = str(out.get("agent", out.get("agent_name", out.get("agent_type", ""))))
+        if "analysis" not in agent.lower():
+            continue
+        for conflict in result.get("conflicts", []) or []:
+            if isinstance(conflict, dict):
+                conflicts.append(conflict)
+    return conflicts
+
+
+def _excerpt(text: str) -> str:
+    """Render a retrieved excerpt readably.
+
+    Chunks start mid-sentence by design, so an excerpt that does not begin at a
+    sentence boundary is prefixed with an ellipsis — the reader is told it is a
+    fragment instead of being shown a broken first word.
+    """
+    collapsed = " ".join(str(text).split())
+    if not collapsed:
+        return ""
+    starts_mid_sentence = collapsed[0].islower() or collapsed[0] in ");,-—"
+    return f"…{collapsed}" if starts_mid_sentence else collapsed
+
+
+def _collect_analysis_gaps(succeeded: list[dict[str, Any]]) -> list[str]:
+    """Collect evidence gaps reported by analysis agents in this run."""
+    gaps: list[str] = []
+    for out in succeeded:
+        result = out.get("result") or out.get("output") or {}
+        if not isinstance(result, dict):
+            continue
+        agent = str(out.get("agent", out.get("agent_name", out.get("agent_type", ""))))
+        if "analysis" not in agent.lower():
+            continue
+        for gap in result.get("gaps", []) or []:
+            if gap and str(gap) not in gaps:
+                gaps.append(str(gap))
+    return gaps
+
+
+def _build_report_sections(
+    *,
+    succeeded: list[dict[str, Any]],
+    ranked_citations: list[dict[str, Any]],
+    evidence_assessment: Any,
+    contradictions: list[dict[str, Any]],
+) -> str:
+    """Render the structured decision sections of the final answer.
+
+    Every line is derived from data the run actually produced: findings and
+    gaps from the analysis task's output, conflicts from cross-agent polarity
+    analysis, sources from retrieved citations.  Nothing is invented and no
+    field is emitted when the run produced no evidence for it — the absence of
+    a section is itself the honest signal.
+    """
+    sections: list[str] = []
+
+    findings = _collect_analysis_findings(succeeded)
+    if findings:
+        lines = ["## Key findings"]
+        for finding in findings[:8]:
+            content = _excerpt(str(finding.get("content", "")))[:320]
+            source = str(finding.get("source") or "unsourced")
+            lines.append(f"- {content} ({source})")
+        sections.append("\n".join(lines))
+
+    source_conflicts = _collect_analysis_conflicts(succeeded)
+    all_conflicts = source_conflicts + list(contradictions)
+    if all_conflicts:
+        lines = ["## Conflicts detected between sources"]
+        for conflict in all_conflicts[:6]:
+            left = conflict.get("left") or {}
+            right = conflict.get("right") or {}
+            left_source = left.get("source") or conflict.get("left_agent") or "source A"
+            right_source = right.get("source") or conflict.get("right_agent") or "source B"
+            lines.append(
+                f"- {left_source} and {right_source} state opposing positions "
+                f"({conflict.get('type', 'conflict')})."
+            )
+        sections.append("\n".join(lines))
+
+    gaps = _collect_analysis_gaps(succeeded)
+    if gaps:
+        lines = ["## Unknowns and evidence gaps"]
+        lines.extend(f"- {gap}" for gap in gaps[:6])
+        sections.append("\n".join(lines))
+
+    if ranked_citations:
+        lines = ["## Sources"]
+        for citation in ranked_citations[:12]:
+            source = str(citation.get("source") or citation.get("document_id") or "unknown")
+            score = citation.get("score", citation.get("quality_score"))
+            suffix = f" (relevance {float(score):.2f})" if isinstance(score, (int, float)) else ""
+            lines.append(f"- {source}{suffix}")
+        sections.append("\n".join(lines))
+
+    if not sections:
+        return ""
+
+    footer = (
+        f"Evidence quality {getattr(evidence_assessment, 'overall_quality', 0.0):.2f} · "
+        f"items {getattr(evidence_assessment, 'total_items', 0)} "
+        f"(strong {getattr(evidence_assessment, 'strong_count', 0)}, "
+        f"moderate {getattr(evidence_assessment, 'moderate_count', 0)}, "
+        f"weak {getattr(evidence_assessment, 'weak_count', 0)}, "
+        f"conflicting {getattr(evidence_assessment, 'conflicting_count', 0)})"
+    )
+    return "\n\n".join(sections) + "\n\n---\n" + footer
+
+
 def _collect_answer_sections(succeeded: list[dict[str, Any]]) -> list[str]:
     """Extract text answer sections from succeeded agent outputs."""
     sections: list[str] = []
@@ -229,7 +374,8 @@ def _extract_claims(text: str) -> list[str]:
 def _detect_contradictions(succeeded: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect contradictions between agent outputs.
 
-    Uses polarity analysis on agent result summaries/answers.
+    Uses the same stance classifier as the analysis agent, so a claim judged a
+    conflict there is not re-judged as consistent here.
     """
     contradictions: list[dict[str, Any]] = []
     outputs: list[tuple[str, str, str]] = []  # (agent, text, polarity)
@@ -246,11 +392,7 @@ def _detect_contradictions(succeeded: list[dict[str, Any]]) -> list[dict[str, An
         if not text or len(text) < 10:
             continue
 
-        lower = text.lower()
-        has_neg = any(m in lower for m in ["not allowed", "prohibited", "denied", "must not", "cannot"])
-        has_pos = any(m in lower for m in ["allowed", "permitted", "required", "must", "approved"])
-        polarity = "negative" if has_neg and not has_pos else ("positive" if has_pos else "neutral")
-        outputs.append((agent, text[:300], polarity))
+        outputs.append((agent, text[:300], evidence_polarity(str(text))))
 
     for i in range(len(outputs)):
         for j in range(i + 1, len(outputs)):

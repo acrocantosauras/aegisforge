@@ -4,9 +4,7 @@ Provides: upload, list, detail, delete documents with tenant isolation.
 """
 from __future__ import annotations
 
-import json
 import logging
-import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -15,15 +13,16 @@ from sqlalchemy.orm import Session
 
 from aegisforge.config import Settings, get_settings
 from aegisforge.db.models import DocumentChunkModel, DocumentModel, UserModel
-from aegisforge.db.session import get_db, get_session_factory
-from aegisforge.rag.embeddings import get_embedding_provider
-from aegisforge.rag.ingestion import ingest_document
-from aegisforge.rag.vector_store import VectorStoreEntry, get_vector_store
+from aegisforge.db.session import get_db
 from aegisforge.security.validation import (
     sanitize_filename,
     validate_document_upload,
 )
 from aegisforge.services.auth_service import get_current_user
+from aegisforge.services.document_service import (
+    build_vector_store,
+    ingest_and_store_document,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,101 +87,29 @@ async def upload_document(
             detail={"violations": validation.violations},
         )
 
-    document_id = f"doc-{uuid.uuid4().hex[:12]}"
-
-    # Ingest
+    # Shared ingestion pipeline (extract → normalize → chunk → embed →
+    # persist → index). Owner-scoped: the document, its chunks, and its
+    # vector rows are all bound to the uploading user.
     try:
-        ingestion_result = ingest_document(
+        ingested = ingest_and_store_document(
+            db,
             content=content,
             title=title,
             content_type=content_type,
-            document_id=document_id,
-            organization_id=user.organization_id,
             source=filename,
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
+            organization_id=user.organization_id,
+            owner_id=user.id,
+            settings=settings,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # Embed and store in vector store
-    try:
-        embedding_provider = get_embedding_provider(
-            settings.embedding_provider,
-            api_key=settings.embedding_api_key,
-            model=settings.embedding_model,
-            dimension=settings.embedding_dimension,
-            batch_size=settings.embedding_batch_size,
-        )
-        vector_store = get_vector_store(
-            "pgvector" if settings.database_url.startswith("postgresql") else "memory",
-            db_session_factory=lambda: get_session_factory(settings)(),
-            dimension=settings.embedding_dimension,
-        )
-
-        if ingestion_result.chunks:
-            texts = [c.content for c in ingestion_result.chunks]
-            embeddings = embedding_provider.embed_texts(texts)
-            entries = [
-                VectorStoreEntry(
-                    id=c.chunk_id,
-                    content=c.content,
-                    embedding=emb,
-                    metadata={
-                        "document_id": c.document_id,
-                        "source": c.source,
-                        "organization_id": user.organization_id,
-                        "owner_id": user.id,
-                    },
-                )
-                for c, emb in zip(ingestion_result.chunks, embeddings)
-            ]
-            # Owner-scoped ingestion (P0 fix): chunks are bound to the
-            # uploading user so retrieval can enforce org AND owner scope.
-            vector_store.add(
-                entries,
-                organization_id=user.organization_id,
-                owner_id=user.id,
-            )
-    except Exception as exc:
-        logger.warning("Vector storage failed (non-fatal): %s", exc)
-
-    # Persist document metadata
-    doc_model = DocumentModel(
-        id=document_id,
-        organization_id=user.organization_id,
-        title=title,
-        content_type=content_type,
-        source=filename,
-        content_hash=ingestion_result.content_hash,
-        chunk_count=len(ingestion_result.chunks),
-        status="completed",
-        doc_metadata=json.dumps(ingestion_result.metadata),
-        uploaded_by=user.id,
-    )
-    db.add(doc_model)
-
-    # Persist chunks
-    for chunk in ingestion_result.chunks:
-        chunk_model = DocumentChunkModel(
-            id=chunk.chunk_id,
-            document_id=document_id,
-            organization_id=user.organization_id,
-            content=chunk.content,
-            position=chunk.position,
-            source=chunk.source,
-            chunk_metadata=json.dumps(chunk.metadata),
-        )
-        db.add(chunk_model)
-
-    db.commit()
-
     return DocumentUploadResponse(
-        document_id=document_id,
-        title=title,
-        chunk_count=len(ingestion_result.chunks),
+        document_id=ingested.document_id,
+        title=ingested.title,
+        chunk_count=ingested.chunk_count,
         status="completed",
-        message=f"Document ingested with {len(ingestion_result.chunks)} chunk(s)",
+        message=f"Document ingested with {ingested.chunk_count} chunk(s)",
     )
 
 
@@ -258,11 +185,7 @@ def delete_document(
     # predicate as retrieval, so a delete can never touch another user's
     # chunks even if document metadata rows were manipulated).
     try:
-        vector_store = get_vector_store(
-            "pgvector" if settings.database_url.startswith("postgresql") else "memory",
-            db_session_factory=lambda: get_session_factory(settings)(),
-            dimension=settings.embedding_dimension,
-        )
+        vector_store = build_vector_store(settings)
         vector_store.delete_by_document(
             document_id, user.organization_id, owner_id=user.id
         )

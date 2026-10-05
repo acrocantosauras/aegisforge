@@ -10,7 +10,13 @@ import { apiClient } from "@/lib/api";
 // Real planner-recognized intents — each produces a genuine multi-agent
 // dependency graph (verified against the deterministic planner). No fake
 // capabilities: what you see here is what the backend actually plans.
-const EXAMPLES: { label: string; intent: string }[] = [
+const EXAMPLES: { label: string; intent: string; flagship?: boolean }[] = [
+  {
+    label: "Flagship demo — vendor evaluation against internal requirements",
+    flagship: true,
+    intent:
+      "Conduct enterprise knowledge research on the Acme Systems data platform procurement decision: compare Northwind Streamline and Helios Fabric against our internal architecture, security, data governance, infrastructure and cost requirements, identify the conflicts between vendor claims and internal policy, and synthesize a recommendation.",
+  },
   {
     label: "Research → Analyze → Synthesize (multi-agent, parallel RAG)",
     intent:
@@ -126,7 +132,7 @@ export default function ExecutePage() {
               <button
                 key={ex.label}
                 type="button"
-                className="intent-example"
+                className={`intent-example${ex.flagship ? " flagship" : ""}`}
                 onClick={() => setIntent(ex.intent)}
               >
                 <span className="label">{ex.label}</span>
@@ -140,6 +146,12 @@ export default function ExecutePage() {
           Execution runs on the distributed worker queue with checkpointing.
           High-risk tool actions pause the workflow for human approval before
           proceeding.
+        </p>
+
+        <p className="t-caption" style={{ marginTop: 6, maxWidth: 640 }}>
+          The flagship demo needs its knowledge base seeded first:{" "}
+          <code className="mono">python scripts/seed_demo.py --email &lt;your email&gt;</code>
+          . See <code className="mono">docs/phase10-flagship-demo.md</code>.
         </p>
       </div>
     </AppShell>

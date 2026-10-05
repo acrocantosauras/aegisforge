@@ -177,3 +177,29 @@ def test_planner_plan_has_valid_structure() -> None:
         assert "description" in task
         assert "assigned_agent_type" in task
         assert "dependencies" in task
+
+
+def test_planner_rag_task_requests_bounded_broad_retrieval() -> None:
+    """The RAG leg must retrieve enough chunks to cover several source documents.
+
+    A compound enterprise question is answered from multiple internal
+    documents; a top_k that returns only a handful of chunks starves the
+    analysis stage of the provenance it needs to compare sources.
+    """
+    planner = PlannerAgent()
+    result = planner.execute(
+        {"intent": "Conduct enterprise knowledge research on retention policy"},
+        _make_context(),
+    )
+    assert result.status == AgentExecutionStatus.COMPLETED
+    rag_tasks = [
+        t
+        for t in result.result["tasks"]
+        if t["assigned_agent_type"] == AgentType.RAG.value
+    ]
+    assert len(rag_tasks) == 1
+    top_k = rag_tasks[0]["input_data"]["top_k"]
+    assert 6 <= top_k <= 20, f"top_k {top_k} is not a bounded, useful default"
+    # Retrieval must stay owner/org scoped via the retrieval service and must
+    # not bypass it with an unfiltered store.
+    assert rag_tasks[0]["input_data"]["similarity_threshold"] == 0.0

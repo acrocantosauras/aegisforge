@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 
 from aegisforge.agents.analysis_agent import AnalysisAgent
-from aegisforge.agents.base import BaseAgent
+from aegisforge.agents.base import AgentExecutionContext, BaseAgent
 from aegisforge.approval.service import ApprovalService
 from aegisforge.domain.models import (
     AgentExecutionStatus,
@@ -18,12 +18,14 @@ from aegisforge.domain.models import (
     ExecutionPlan,
     ExecutionPlanTask,
     RequestStatus,
+    TaskExecutionRecord,
     TaskFailurePolicy,
 )
 from aegisforge.workflows.scheduler import (
     AgentFactory,
     ExecutionConfig,
     MultiAgentExecutor,
+    TaskInputResolver,
     validate_execution_plan,
 )
 
@@ -459,3 +461,118 @@ class TestApprovalGate:
         assert resumed.records["t1"].status == AgentExecutionStatus.PENDING
         assert resumed.records["t1"].summary == ""
         assert resumed.approval_task_id == "t1"
+
+
+class TestPerSourceEvidenceExpansion:
+    """``evidence_from`` expands a dependency's *sources*, not its blob.
+
+    A RAG dependency contributes one evidence item per retrieved citation (each
+    with its own source and relevance), which is what lets the analysis stage
+    detect conflicts between individual sources.  Summary-only dependencies
+    keep contributing a single item.
+    """
+
+    def _rag_record(self) -> TaskExecutionRecord:
+        return TaskExecutionRecord(
+            task_id="rag-1",
+            agent_type=AgentType.RAG,
+            status=AgentExecutionStatus.COMPLETED,
+            summary="Retrieved 2 chunk(s)",
+            output={"answer": "Based on 2 retrieved document(s)", "query": "policy"},
+            evidence=[
+                {
+                    "chunk_id": "c1",
+                    "source": "data-governance-policy.md",
+                    "score": 0.62,
+                    "snippet": "Data must remain inside the UK and EEA.",
+                },
+                {
+                    "chunk_id": "c2",
+                    "source": "vendor-brief.md",
+                    "score": 0.41,
+                    "snippet": "Data residency is determined by deployment.",
+                },
+            ],
+        )
+
+    def test_citations_become_individual_evidence_items(self):
+        task = _task(
+            "analysis",
+            agent_type=AgentType.ANALYSIS,
+            dependencies=["rag-1"],
+            input_data={"query": "residency", "evidence_from": ["rag-1"]},
+        )
+        resolved, _warnings = TaskInputResolver.resolve(
+            task, {"rag-1": self._rag_record()}
+        )
+        evidence = resolved["evidence"]
+        assert len(evidence) == 2
+        assert {e["source"] for e in evidence} == {
+            "data-governance-policy.md",
+            "vendor-brief.md",
+        }
+        # Provenance and the retriever's own relevance score are preserved.
+        assert all(e["task_id"] == "rag-1" for e in evidence)
+        assert all(e["agent"] == AgentType.RAG.value for e in evidence)
+        assert {e["relevance"] for e in evidence} == {0.62, 0.41}
+        assert all(e["chunk_id"] for e in evidence)
+
+    def test_conflicting_sources_are_detected_by_the_analysis_agent(self):
+        record = TaskExecutionRecord(
+            task_id="rag-1",
+            agent_type=AgentType.RAG,
+            status=AgentExecutionStatus.COMPLETED,
+            summary="Retrieved 2 chunk(s)",
+            output={"answer": "irrelevant", "query": "q"},
+            evidence=[
+                {
+                    "chunk_id": "c1",
+                    "source": "security-baseline.md",
+                    "score": 0.7,
+                    "snippet": "Encryption keys must be customer managed for all data.",
+                },
+                {
+                    "chunk_id": "c2",
+                    "source": "vendor-brief.md",
+                    "score": 0.6,
+                    "snippet": "Customer-managed keys are not available on this tier.",
+                },
+            ],
+        )
+        task = _task(
+            "analysis",
+            agent_type=AgentType.ANALYSIS,
+            dependencies=["rag-1"],
+            input_data={"query": "encryption keys", "evidence_from": ["rag-1"]},
+        )
+        resolved, _ = TaskInputResolver.resolve(task, {"rag-1": record})
+        result = AnalysisAgent().execute(
+            resolved,
+            AgentExecutionContext(request_id="req-test", organization_id="org-1"),
+        )
+        assert result.status == AgentExecutionStatus.COMPLETED
+        assert result.result["evidence_reviewed"] == 2
+        assert result.result["conflicts"], (
+            "two sources disagreeing about customer-managed keys must be surfaced"
+        )
+        sides = {c["right"]["source"] for c in result.result["conflicts"]}
+        assert "vendor-brief.md" in sides or "security-baseline.md" in sides
+
+    def test_summary_only_dependency_still_contributes_one_item(self):
+        record = TaskExecutionRecord(
+            task_id="research-1",
+            agent_type=AgentType.RESEARCH,
+            status=AgentExecutionStatus.COMPLETED,
+            summary="Policy found",
+            output={"answer": "Access requires manager approval", "source": "internal-policy"},
+            evidence=[{"source": "internal-policy", "topic": "Data Access Policy"}],
+        )
+        task = _task(
+            "analysis",
+            agent_type=AgentType.ANALYSIS,
+            dependencies=["research-1"],
+            input_data={"query": "access", "evidence_from": ["research-1"]},
+        )
+        resolved, _ = TaskInputResolver.resolve(task, {"research-1": record})
+        assert len(resolved["evidence"]) == 1
+        assert resolved["evidence"][0]["source"] == "internal-policy"

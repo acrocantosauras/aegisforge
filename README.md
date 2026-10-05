@@ -267,6 +267,33 @@ Concrete failure example (deny-by-default):
 - **Production boundary:** Redis is required for asynchronous production submission; Redis failures return `503` rather than using an in-memory queue. A live API-to-Redis-to-worker test passed with PostgreSQL/pgvector, Redis, and the separate worker running under Docker.
 - **Known limitation:** Python thread-based task work cannot be force-cancelled. Timed-out work is marked terminal, late results are discarded, and the scheduler does not wait for the abandoned thread.
 
+### Phase 10 — Flagship Demo
+
+One canonical enterprise decision, executed end-to-end by the real platform:
+a vendor evaluation against internal architecture, security, data-governance,
+operational and cost requirements.
+
+```
+USER REQUEST → PLANNER → TASK GRAPH → RESEARCH ∥ RAG → ANALYSIS → SYNTHESIS
+             → EVALUATION → GROUNDED REPORT + CITATIONS
+```
+
+The demo ingests a synthetic Acme Systems corpus through the real RAG pipeline,
+runs the canonical request through the worker queue, and surfaces the workflow
+graph, real tool activity, retrieved evidence, detected conflicts between vendor
+claims and internal policy, and a measured evaluation. Nothing is mocked, no
+citations are invented, and no chain-of-thought is exposed.
+
+```bash
+docker compose up -d                                    # API, workers, Postgres, Redis
+cd frontend && npm run dev                              # :3000 (or -p 3131)
+python scripts/seed_demo.py --email <your email>        # real ingestion pipeline
+# Sign in → Execute → "Flagship demo" example → Submit & Execute
+```
+
+See [`docs/phase10-flagship-demo.md`](docs/phase10-flagship-demo.md) for the full
+walkthrough and [`demo/README.md`](demo/README.md) for the dataset.
+
 ## Local Setup
 
 ### Prerequisites
@@ -416,6 +443,8 @@ pytest tests/test_workflow.py -v
 - [Engineering Standards](docs/engineering-standards.md)
 - [Testing Strategy](docs/testing/testing-strategy.md)
 - [Use Cases](docs/requirements/use-cases.md)
+- [Phase 10 — Flagship Demo](docs/phase10-flagship-demo.md)
+- [Demo dataset](demo/README.md)
 - [ADR 0001: Modular Monolith](docs/adr/0001-modular-monolith.md)
 - [ADR 0002: Agent/Tool/Workflow Execution](docs/adr/0002-agent-tool-workflow-execution.md)
 - [ADR 0003: Combined Phase 3](docs/adr/0003-combined-phase3-rag-planner-mcp-async-approval.md)

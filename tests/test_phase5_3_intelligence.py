@@ -790,3 +790,92 @@ class TestSecurityTenantIsolation:
         # The assessment should not include the raw secret in public output
         public = assessment.to_dict()
         assert "sk-12345" not in str(public)  # Should not be in metadata
+
+
+class TestStructuredDecisionReport:
+    """The final answer must be readable as a decision memo.
+
+    Every section is derived from data the run actually produced (analysis
+    findings/conflicts/gaps, ranked citations, evidence assessment).  Nothing is
+    invented, and a section is omitted when the run produced no evidence for it.
+    """
+
+    def _run_with_analysis(self) -> dict:
+        return synthesize_results(
+            "Which platform should we adopt?",
+            [
+                {
+                    "agent": "research",
+                    "status": "completed",
+                    "summary": "Vendor brief retrieved",
+                    "result": {"answer": "Vendor brief retrieved"},
+                    "evidence": [
+                        {
+                            "source": "vendor-brief.md",
+                            "score": 0.7,
+                            "content": "The platform is delivered only as a hosted service.",
+                        }
+                    ],
+                },
+                {
+                    "agent": "analysis",
+                    "status": "completed",
+                    "summary": "Analyzed 2 evidence item(s): 2 relevant, 1 conflict(s), 1 gap(s)",
+                    "result": {
+                        "answer": "Analyzed 2 evidence item(s)",
+                        "findings": [
+                            {
+                                "content": "on-premises deployment is required for the regulated data plane",
+                                "source": "architecture-requirements.md",
+                                "relevance": 0.8,
+                            },
+                            {
+                                "content": "the vendor offers no on-premises edition",
+                                "source": "vendor-brief.md",
+                                "relevance": 0.7,
+                            },
+                        ],
+                        "conflicts": [
+                            {
+                                "type": "polarity_conflict",
+                                "left": {"source": "architecture-requirements.md", "polarity": "positive"},
+                                "right": {"source": "vendor-brief.md", "polarity": "negative"},
+                            }
+                        ],
+                        "gaps": ["Fewer than two corroborating sources available"],
+                    },
+                },
+            ],
+        )
+
+    def test_report_contains_findings_conflicts_gaps_and_sources(self) -> None:
+        answer = self._run_with_analysis()["answer"]
+        assert "## Key findings" in answer
+        assert "architecture-requirements.md" in answer
+        assert "## Conflicts detected between sources" in answer
+        assert "## Unknowns and evidence gaps" in answer
+        assert "## Sources" in answer
+        # Every finding is attributed to the source it came from.
+        assert "vendor-brief.md" in answer
+
+    def test_report_states_measured_evidence_quality(self) -> None:
+        result = self._run_with_analysis()
+        quality = result["evidence_assessment"]["overall_quality"]
+        assert "Evidence quality" in result["answer"]
+        assert f"{quality:.2f}" in result["answer"]
+        # The footer reports evidence quality, not the composite confidence.
+        assert "Confidence " not in result["answer"]
+
+    def test_no_findings_means_no_findings_section(self) -> None:
+        result = synthesize_results(
+            "Simple question",
+            [{"agent": "research", "status": "completed", "summary": "Answer", "result": {"answer": "Answer"}}],
+        )
+        assert "## Key findings" not in result["answer"]
+
+    def test_report_never_invents_sources(self) -> None:
+        answer = self._run_with_analysis()["answer"]
+        sources_block = answer.split("## Sources", 1)[1]
+        # Only sources that were actually cited may appear as source lines.
+        assert "vendor-brief.md" in sources_block
+        assert "unrelated-source.md" not in sources_block

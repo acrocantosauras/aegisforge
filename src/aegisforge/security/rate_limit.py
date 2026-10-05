@@ -116,20 +116,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         redis = _get_redis(self._settings)
         now = int(time.time())
-        window_start = now - (now % self._window_seconds)
 
         try:
             if redis is not None:
-                bucket = f"ratelimit:{key}:{window_start}"
+                # Window starts at the first request in the bucket (TTL governs),
+                # not at the wall-clock boundary: a boundary-aligned window lets
+                # a client send up to 2x the limit across the boundary.
+                bucket = f"ratelimit:{key}"
                 count = redis.incr(bucket)
                 if count == 1:
                     redis.expire(bucket, self._window_seconds + 1)
             else:
-                bucket_key = f"{key}:{window_start}"
-                prev_start, prev_count = self._fallback_store.get(bucket_key, (window_start, 0))
-                if prev_start != window_start:
+                bucket_key = key
+                window_start, prev_count = self._fallback_store.get(bucket_key, (now, 0))
+                if now - window_start >= self._window_seconds:
                     count = 1
-                    self._fallback_store[bucket_key] = (window_start, count)
+                    self._fallback_store[bucket_key] = (now, count)
                 else:
                     count = prev_count + 1
                     self._fallback_store[bucket_key] = (window_start, count)

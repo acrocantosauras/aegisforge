@@ -231,7 +231,12 @@ def _generate_multi_agent_plan(
                 task_id=task_ids[1],
                 description=f"Retrieve enterprise knowledge base for: {intent}",
                 assigned_agent_type=AgentType.RAG,
-                input_data={"query": intent, "top_k": 4, "similarity_threshold": 0.0},
+                # A compound enterprise question usually spans several source
+                # documents; retrieving only a handful of chunks starves the
+                # analysis stage of the provenance it needs to surface
+                # conflicts between sources.  ``top_k`` is bounded and the
+                # retriever stays org + owner scoped.
+                input_data={"query": intent, "top_k": 8, "similarity_threshold": 0.0},
                 dependencies=[],
                 expected_output_description="Tenant-scoped retrieved chunks with citations",
                 tool_permissions_required=["knowledge.search"],

@@ -159,3 +159,36 @@ class TestWS13ProductionRateLimit:
             client.get("/api/v1/requests")
         # Liveness probe stays reachable even when the bucket is exhausted.
         assert client.get("/api/v1/health").status_code == 200
+
+class TestWindowBoundary:
+    """The window starts at the first request, not at the clock boundary.
+
+    A boundary-aligned window lets a client send up to 2x the limit inside a
+    few milliseconds across the boundary; the fixed-window TTL start removes
+    that burst.
+    """
+
+    def test_window_does_not_reset_at_the_clock_boundary(self, monkeypatch) -> None:
+        import aegisforge.security.rate_limit as rl
+
+        client = _make_client(
+            rate_limit_enabled=True,
+            rate_limit_max_requests=5,
+            rate_limit_window_seconds=60,
+        )
+        now = [1_000_000.4]  # just after a 60s boundary
+        monkeypatch.setattr(rl.time, "time", lambda: now[0])
+
+        for _ in range(5):
+            assert client.get("/api/v1/requests").status_code == 401
+
+        # Cross the wall-clock minute boundary (…020) while only ~30s of the
+        # 60s window has elapsed: the window must NOT reset.
+        now[0] = 1_000_030.1
+        resp = client.get("/api/v1/requests")
+        assert resp.status_code == 429, "boundary crossing must not refill the bucket"
+        assert resp.headers.get("Retry-After") is not None
+
+        # The window only refills once it has genuinely elapsed.
+        now[0] = 1_000_065.5
+        assert client.get("/api/v1/requests").status_code == 401

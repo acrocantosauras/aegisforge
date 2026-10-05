@@ -35,6 +35,67 @@ def _token_overlap(query: str, content: str) -> float:
     return len(overlap) / len(query_tokens)
 
 
+# Phrases that state a requirement, permission, or endorsement.
+_POSITIVE_MARKERS = (
+    "must",
+    "shall",
+    "required",
+    "mandatory",
+    "permitted",
+    "allowed",
+    "approved",
+    "supported",
+    "recommended",
+    "required by",
+)
+
+# Phrases that state a prohibition, denial, or absence of capability.  A
+# negation wins over any positive word that happens to be a substring of it
+# ("not available" contains "available", "unsupported" contains "supported"),
+# which is why negation is evaluated first and exclusively.
+_NEGATIVE_MARKERS = (
+    "not allowed",
+    "not permitted",
+    "not supported",
+    "not available",
+    "not committed",
+    "not included",
+    "no longer",
+    "must not",
+    "cannot",
+    "can not",
+    "does not",
+    "do not",
+    "is not",
+    "are not",
+    "unsupported",
+    "unavailable",
+    "prohibited",
+    "forbidden",
+    "denied",
+    "excluded",
+    "disabled",
+)
+
+
+def evidence_polarity(text: str) -> str:
+    """Classify a statement's stance as ``positive``/``negative``/``neutral``.
+
+    Conflict detection between sources is only as good as this classifier: a
+    vendor brief that says a control "is not available" and an internal policy
+    that says the control "must" be in place are in direct conflict, and a
+    naive substring scan would call both of them positive.
+    """
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return "neutral"
+    if any(marker in lowered for marker in _NEGATIVE_MARKERS):
+        return "negative"
+    if any(marker in lowered for marker in _POSITIVE_MARKERS):
+        return "positive"
+    return "neutral"
+
+
 def analyze_evidence(query: str, evidence: list[dict[str, Any]]) -> dict[str, Any]:
     """Deterministic structured analysis over a list of evidence items.
 
@@ -63,20 +124,16 @@ def analyze_evidence(query: str, evidence: list[dict[str, Any]]) -> dict[str, An
             }
         )
 
-    # Conflict detection: statements that disagree on key magnitudes/directions.
+    # Conflict detection: statements that disagree on stance (a requirement vs
+    # a prohibition) are surfaced instead of silently averaged away.
     conflicts: list[dict[str, Any]] = []
-    negative_markers = ("not allowed", "prohibited", "denied", "no ", "must not", "cannot")
-    positive_markers = ("allowed", "permitted", "required", "must", "approved")
     polarity: list[dict[str, Any]] = []
     for item in evidence:
-        content = str(item.get("content", "")).lower()
-        neg = any(m in content for m in negative_markers)
-        pos = any(m in content for m in positive_markers)
         polarity.append(
             {
                 "source": item.get("source", ""),
                 "task_id": item.get("task_id", item.get("agent", "")),
-                "polarity": "negative" if neg and not pos else ("positive" if pos else "neutral"),
+                "polarity": evidence_polarity(str(item.get("content", ""))),
             }
         )
     for i in range(len(polarity)):
