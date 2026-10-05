@@ -3,18 +3,25 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import DocumentsPage from "@/app/documents/page";
 
-const { listDocumentsMock, uploadDocumentMock, deleteDocumentMock } = vi.hoisted(() => ({
+const { pushMock, listDocumentsMock, uploadDocumentMock, deleteDocumentMock } = vi.hoisted(() => ({
+  pushMock: vi.fn(),
   listDocumentsMock: vi.fn(),
   uploadDocumentMock: vi.fn(),
   deleteDocumentMock: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => ({ push: pushMock, back: vi.fn() }),
+  usePathname: () => "/",
 }));
 
-vi.mock("@/components/Sidebar", () => ({
-  default: () => <nav>Sidebar</nav>,
+vi.mock("@/components/shell/AppShell", () => ({
+  default: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <div>
+      {actions}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -61,7 +68,7 @@ describe("DocumentsPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Architecture Overview")).toBeInTheDocument();
     });
-    expect(screen.getByText("12")).toBeInTheDocument();
+    expect(screen.getAllByText("12").length).toBeGreaterThan(0);
   });
 
   it("uploads a file and refreshes the list", async () => {
@@ -102,7 +109,7 @@ describe("DocumentsPage", () => {
       expect(uploadDocumentMock).toHaveBeenCalledWith(file, "policy.md", "tok");
     });
     await waitFor(() => {
-      expect(screen.getByText('Uploaded "policy.md" — 5 chunks created.')).toBeInTheDocument();
+      expect(screen.getByText('Uploaded "policy.md" — 5 chunks indexed.')).toBeInTheDocument();
     });
     await waitFor(() => {
       expect(screen.getByText("policy.md")).toBeInTheDocument();
@@ -143,12 +150,12 @@ describe("DocumentsPage", () => {
       page_size: 50,
     });
     deleteDocumentMock.mockResolvedValue(undefined);
-    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(true);
 
     const user = userEvent.setup();
     render(<DocumentsPage />);
 
-    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    await user.click(await screen.findByRole("button", { name: /Delete/ }));
+    await user.click(await screen.findByRole("button", { name: "Delete document" }));
 
     await waitFor(() => {
       expect(deleteDocumentMock).toHaveBeenCalledWith("doc-1", "tok");
@@ -156,7 +163,6 @@ describe("DocumentsPage", () => {
     await waitFor(() => {
       expect(screen.queryByText("To Delete")).not.toBeInTheDocument();
     });
-    confirmMock.mockRestore();
   });
 
   it("does not delete when the user cancels the confirmation", async () => {
@@ -174,16 +180,13 @@ describe("DocumentsPage", () => {
       total: 1,
       page: 1,
       page_size: 50,
-    });
-    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(false);
-
-    const user = userEvent.setup();
+    });    const user = userEvent.setup();
     render(<DocumentsPage />);
 
-    await user.click(await screen.findByRole("button", { name: "Delete" }));
+    await user.click(await screen.findByRole("button", { name: /Delete/ }));
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
 
     expect(deleteDocumentMock).not.toHaveBeenCalled();
     expect(screen.getByText("Keep Me")).toBeInTheDocument();
-    confirmMock.mockRestore();
   });
 });

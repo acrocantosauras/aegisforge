@@ -305,14 +305,84 @@ export class ApiClient {
     }>(`/audit?limit=${limit}`, { token });
   }
 
+  // Agents
+  async listAgents(token: string) {
+    return this.request<{
+      agents: {
+        agent_type: string;
+        name: string;
+        description: string;
+        capabilities: string[];
+      }[];
+      total: number;
+    }>("/agents", { token });
+  }
+
+  // Tools & MCP
+  async listTools(token: string) {
+    return this.request<{
+      tools: {
+        name: string;
+        description: string;
+        version: string;
+        permission_requirements: string[];
+        timeout_seconds: number;
+        requires_approval: boolean;
+        risk_level: string;
+        read_only: boolean;
+        external_side_effect: boolean;
+        data_sensitivity: string;
+      }[];
+      total: number;
+    }>("/tools", { token });
+  }
+
+  async listMCPServers(token: string) {
+    return this.request<{
+      servers: {
+        server_id: string;
+        name: string;
+        description: string;
+        version: string;
+        transport: string;
+        enabled: boolean;
+        allowed_tools: string[];
+        risk_level: string;
+        read_only_default: boolean;
+        timeout_seconds: number;
+        health: Record<string, unknown>;
+        tool_count: number;
+      }[];
+      total: number;
+    }>("/mcp/servers", { token });
+  }
+
+  async listMCPTools(token: string) {
+    return this.request<{
+      tools: {
+        name: string;
+        server_id: string;
+        tool_name: string;
+        description: string;
+        risk_level: string;
+        read_only: boolean;
+      }[];
+      total: number;
+    }>("/mcp/tools", { token });
+  }
+
   // Health
   async healthCheck() {
     return this.request<{ status: string }>("/health");
   }
 
-  /** Real component status: database, Redis, workers, queue depth. */
-  async systemStatus() {
-    return this.request<SystemStatus>("/system");
+  /** Real component status: database, Redis, workers, queue depth.
+   *
+   * `/system` is an authenticated operational endpoint — the bearer token is
+   * required, otherwise every call 401s and no status can be shown.
+   */
+  async systemStatus(token?: string | null) {
+    return this.request<SystemStatus>("/system", { token: token ?? undefined });
   }
 }
 
@@ -344,6 +414,8 @@ export interface WorkflowEvaluation {
     task_count?: number;
     parallel_waves?: number;
     max_parallelism?: number;
+    /** Backend PlanEvaluationResult reports ``overall_score``. */
+    overall_score?: number;
     score?: number;
   };
   collaboration?: {

@@ -2,7 +2,27 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { ShieldCheck, GitBranch, Activity } from "lucide-react";
 import { useAuth } from "@/lib/auth";
+import { BrandMark } from "@/components/shell/AppShell";
+
+const HIGHLIGHTS = [
+  {
+    icon: <GitBranch size={15} />,
+    title: "Multi-agent orchestration",
+    text: "Requests are planned into validated task graphs and executed by specialized agents.",
+  },
+  {
+    icon: <ShieldCheck size={15} />,
+    title: "Security by default",
+    text: "Tenant isolation, permission gates, and human approval for high-risk actions.",
+  },
+  {
+    icon: <Activity size={15} />,
+    title: "Durable execution",
+    text: "Checkpointed workflows survive restarts — retries, recovery, and audit trails built in.",
+  },
+];
 
 export default function LoginPage() {
   const [isRegister, setIsRegister] = useState(false);
@@ -23,8 +43,10 @@ export default function LoginPage() {
     try {
       if (isRegister) {
         await register(email, password, fullName);
+        localStorage.setItem("aegisforge_email", email);
       } else {
         await login(email, password);
+        localStorage.setItem("aegisforge_email", email);
       }
       router.push("/dashboard");
     } catch (err: unknown) {
@@ -35,98 +57,121 @@ export default function LoginPage() {
   };
 
   return (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "center",
-        alignItems: "center",
-        minHeight: "100vh",
-        background: "#f5f5f5",
-      }}
-    >
-      <div
-        className="card"
-        style={{ width: 400, padding: 32 }}
-      >
-        <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8, textAlign: "center" }}>
-          AegisForge
-        </h1>
-        <p style={{ textAlign: "center", color: "var(--muted)", marginBottom: 24, fontSize: 14 }}>
-          Enterprise Multi-Agent AI Platform
-        </p>
-
-        {error && (
-          <div className="error" style={{ marginBottom: 16, padding: 8, background: "#f8d7da", borderRadius: 6 }}>
-            {error}
+    <div className="login-page">
+      <div className="login-panel">
+        <div className="login-brand-side">
+          <div className="lp-hero-bg" aria-hidden="true">
+            <div className="lp-hero-grid" />
+            <div className="lp-hero-glow" />
           </div>
-        )}
-
-        <form onSubmit={handleSubmit}>
-          {isRegister && (
-            <div className="form-group">
-              <label htmlFor="fullName">Full Name</label>
-              <input
-                id="fullName"
-                type="text"
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                required
-              />
-            </div>
-          )}
-
-          <div className="form-group">
-            <label htmlFor="email">Email</label>
-            <input
-              id="email"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-            />
+          <div className="brand-row">
+            <BrandMark size={30} />
+            <span className="brand-name" style={{ fontSize: "1.05rem" }}>
+              AEGIS<span className="thin">FORGE</span>
+            </span>
           </div>
-
-          <div className="form-group">
-            <label htmlFor="password">Password</label>
-            <input
-              id="password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              minLength={8}
-            />
+          <h2 className="login-tagline">
+            The control plane for multi-agent AI work.
+          </h2>
+          <div className="login-highlights">
+            {HIGHLIGHTS.map((h) => (
+              <div key={h.title} className="login-highlight">
+                <span className="hl-icon">{h.icon}</span>
+                <span>
+                  <strong>{h.title}</strong>
+                  <p>{h.text}</p>
+                </span>
+              </div>
+            ))}
           </div>
+          <p className="login-foot">
+            Plan → execute → evaluate → recover. Real workflows, real oversight.
+          </p>
+        </div>
 
-          <button
-            type="submit"
-            className="primary"
-            style={{ width: "100%", padding: 10, marginTop: 8 }}
-            disabled={loading}
-          >
-            {loading ? "Please wait..." : isRegister ? "Create Account" : "Sign In"}
-          </button>
-        </form>
+        <div className="login-form-side">
+          <div className="login-form-box">
+            <h1 style={{ fontSize: "var(--text-h2)", fontWeight: 640, letterSpacing: "-0.02em" }}>
+              {isRegister ? "Create your account" : "Sign in to AegisForge"}
+            </h1>
+            <p className="t-small" style={{ marginBottom: 24 }}>
+              {isRegister
+                ? "Set up your operator account to launch workflows."
+                : "Enter your credentials to access the workspace."}
+            </p>
 
-        <p style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: "var(--muted)" }}>
-          {isRegister ? "Already have an account?" : "Need an account?"}{" "}
-          <button
-            type="button"
-            onClick={() => {
-              setIsRegister(!isRegister);
-              setError("");
-            }}
-            style={{
-              background: "none",
-              color: "var(--primary)",
-              padding: 0,
-              fontWeight: 500,
-              fontSize: 13,
-            }}
-          >
-            {isRegister ? "Sign In" : "Register"}
-          </button>
-        </p>
+            {error && (
+              <div className="error" role="alert" style={{ marginBottom: 16 }}>
+                {error}
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit}>
+              {isRegister && (
+                <div className="form-group">
+                  <label htmlFor="fullName">Full Name</label>
+                  <input
+                    id="fullName"
+                    type="text"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    required
+                    autoComplete="name"
+                  />
+                </div>
+              )}
+
+              <div className="form-group">
+                <label htmlFor="email">Email</label>
+                <input
+                  id="email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  autoComplete="email"
+                />
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="password">Password</label>
+                <input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  minLength={8}
+                  autoComplete={isRegister ? "new-password" : "current-password"}
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="primary"
+                style={{ width: "100%", padding: 11, marginTop: 8 }}
+                disabled={loading}
+              >
+                {loading ? "Please wait…" : isRegister ? "Create Account" : "Sign In"}
+              </button>
+            </form>
+
+            <p style={{ textAlign: "center", marginTop: 18, fontSize: 13, color: "var(--fg-muted)" }}>
+              {isRegister ? "Already have an account?" : "Need an account?"}{" "}
+              <button
+                type="button"
+                className="ghost"
+                style={{ color: "var(--accent)", padding: 0, fontWeight: 600 }}
+                onClick={() => {
+                  setIsRegister(!isRegister);
+                  setError("");
+                }}
+              >
+                {isRegister ? "Sign In" : "Register"}
+              </button>
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

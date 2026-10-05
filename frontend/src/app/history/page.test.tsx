@@ -8,11 +8,18 @@ const { pushMock, getRequestHistoryMock } = vi.hoisted(() => ({
 }));
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: pushMock }),
+  useRouter: () => ({ push: pushMock, back: vi.fn() }),
+  usePathname: () => "/",
+  useSearchParams: () => new URLSearchParams(),
 }));
 
-vi.mock("@/components/Sidebar", () => ({
-  default: () => <nav>Sidebar</nav>,
+vi.mock("@/components/shell/AppShell", () => ({
+  default: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <div>
+      {actions}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -62,9 +69,9 @@ describe("HistoryPage", () => {
       expect(screen.getByText(/enterprise knowledge research/)).toBeInTheDocument();
     });
     expect(screen.getByText(/failing vendor feed/)).toBeInTheDocument();
-    expect(screen.getByText("completed")).toBeInTheDocument();
-    expect(screen.getByText("failed")).toBeInTheDocument();
-    expect(screen.getByText("executing")).toBeInTheDocument();
+    expect(screen.getByText("Complete")).toBeInTheDocument();
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByText("Running")).toBeInTheDocument();
   });
 
   it("filters by status", async () => {

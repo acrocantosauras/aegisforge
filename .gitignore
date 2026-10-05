@@ -38,8 +38,15 @@ npm-debug.log*
 tsconfig.tsbuildinfo
 next-env.d.ts
 
+# --- Frontend browser QA harness ---
+# frontend/.qa/*.mjs are the QA scripts (kept); everything below is generated
+# per-run material: the disposable Chrome profile, screenshots, and JSON reports.
+frontend/.qa/profile/
+frontend/.qa/*.png
+frontend/.qa/*-out.json
+
 # --- OS / editor ---
 .DS_Store
 Thumbs.db
 .idea/
-.vscode/
+.vscode/

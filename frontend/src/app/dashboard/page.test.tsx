@@ -1,11 +1,13 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import DashboardPage from "@/app/dashboard/page";
 
-const pushMock = vi.fn();
+const { pushMock } = vi.hoisted(() => ({ pushMock: vi.fn() }));
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: pushMock }),
+  useRouter: () => ({ push: pushMock, back: vi.fn() }),
+  usePathname: () => "/",
 }));
 
 vi.mock("next/link", () => ({
@@ -14,8 +16,13 @@ vi.mock("next/link", () => ({
   ),
 }));
 
-vi.mock("@/components/Sidebar", () => ({
-  default: () => <nav>Sidebar</nav>,
+vi.mock("@/components/shell/AppShell", () => ({
+  default: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <div>
+      {actions}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -30,7 +37,7 @@ vi.mock("@/lib/api", () => ({
   apiClient: {
     listRequests: vi.fn(),
     listApprovals: vi.fn(),
-    getMetrics: vi.fn(),
+    listAgents: vi.fn().mockResolvedValue({ agents: [], total: 0 }),
   },
 }));
 
@@ -42,7 +49,8 @@ describe("DashboardPage", () => {
     pushMock.mockReset();
     mockedApi.listRequests.mockReset();
     mockedApi.listApprovals.mockReset();
-    mockedApi.getMetrics.mockReset();
+    mockedApi.listAgents.mockReset();
+    mockedApi.listAgents.mockResolvedValue({ agents: [], total: 0 });
   });
 
   it("renders stats, requests, and pending approvals from the API", async () => {
@@ -65,14 +73,6 @@ describe("DashboardPage", () => {
       ],
       total: 1,
     });
-    mockedApi.getMetrics.mockResolvedValue({
-      count: 2,
-      avg_workflow_duration_ms: 100,
-      total_tool_calls: 5,
-      total_retries: 0,
-      total_failures: 0,
-      success_rate: 1.0,
-    });
 
     render(<DashboardPage />);
 
@@ -82,19 +82,54 @@ describe("DashboardPage", () => {
     expect(screen.getByText("Draft a report")).toBeInTheDocument();
     expect(screen.getByText("Needs Approval")).toBeInTheDocument();
     expect(screen.getByText("Send email to external party")).toBeInTheDocument();
-    expect(screen.getByText("100%")).toBeInTheDocument(); // success rate
+
+    // Stats are derived from the tenant-scoped request list, never from the
+    // process-global metrics endpoint: 2 requests, 1 of 1 finished workflows
+    // completed, 1 still in flight.
+    const stats = Array.from(
+      document.querySelectorAll(".stat-grid .stat-card")
+    ).map((card) => ({
+      label: card.querySelector(".label")?.textContent,
+      value: card.querySelector(".value")?.textContent,
+    }));
+    expect(stats).toEqual([
+      { label: "Requests", value: "2" },
+      { label: "Success Rate", value: "100%" },
+      { label: "In Progress", value: "1" },
+      { label: "Pending Approvals", value: "1" },
+    ]);
   });
 
   it("handles API failures gracefully and still renders the empty dashboard", async () => {
     mockedApi.listRequests.mockRejectedValue(new Error("boom"));
     mockedApi.listApprovals.mockRejectedValue(new Error("boom"));
-    mockedApi.getMetrics.mockRejectedValue(new Error("boom"));
 
     render(<DashboardPage />);
 
     await waitFor(() => {
-      expect(screen.getByText("No requests yet. Create your first request.")).toBeInTheDocument();
+      expect(screen.getByText("No executions yet")).toBeInTheDocument();
     });
+    expect(
+      screen.getByText("Could not reach the control plane API.")
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Retry/ })).toBeInTheDocument();
+  });
+
+  it("reloads the dashboard when Retry is pressed", async () => {
+    mockedApi.listRequests.mockRejectedValueOnce(new Error("boom"));
+    mockedApi.listApprovals.mockResolvedValue({ approvals: [], total: 0 });
+    const user = userEvent.setup();
+
+    render(<DashboardPage />);
+
+    const retry = await screen.findByRole("button", { name: /Retry/ });
+    mockedApi.listRequests.mockResolvedValue([
+      { id: "req-9", intent: "Recovered", status: "completed", created_at: "now" },
+    ]);
+    await user.click(retry);
+
+    expect(await screen.findByText("Recovered")).toBeInTheDocument();
+    expect(mockedApi.listRequests).toHaveBeenCalledTimes(2);
   });
 
   it("navigates to the request detail when a row is clicked", async () => {
@@ -102,14 +137,6 @@ describe("DashboardPage", () => {
       { id: "req-42", intent: "Click me", status: "completed", created_at: "now" },
     ]);
     mockedApi.listApprovals.mockResolvedValue({ approvals: [], total: 0 });
-    mockedApi.getMetrics.mockResolvedValue({
-      count: 1,
-      avg_workflow_duration_ms: 0,
-      total_tool_calls: 0,
-      total_retries: 0,
-      total_failures: 0,
-      success_rate: 0,
-    });
 
     render(<DashboardPage />);
 

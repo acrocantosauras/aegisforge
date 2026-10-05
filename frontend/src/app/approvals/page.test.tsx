@@ -3,18 +3,25 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ApprovalsPage from "@/app/approvals/page";
 
-const { listApprovalsMock, approveRequestMock, rejectRequestMock } = vi.hoisted(() => ({
+const { pushMock, listApprovalsMock, approveRequestMock, rejectRequestMock } = vi.hoisted(() => ({
+  pushMock: vi.fn(),
   listApprovalsMock: vi.fn(),
   approveRequestMock: vi.fn(),
   rejectRequestMock: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => ({ push: pushMock, back: vi.fn() }),
+  usePathname: () => "/",
 }));
 
-vi.mock("@/components/Sidebar", () => ({
-  default: () => <nav>Sidebar</nav>,
+vi.mock("@/components/shell/AppShell", () => ({
+  default: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <div>
+      {actions}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -55,7 +62,7 @@ describe("ApprovalsPage", () => {
     listApprovalsMock.mockResolvedValue({ approvals: [], total: 0 });
     render(<ApprovalsPage />);
     await waitFor(() => {
-      expect(screen.getByText("No pending approval requests.")).toBeInTheDocument();
+      expect(screen.getByText("Queue clear")).toBeInTheDocument();
     });
   });
 
@@ -66,7 +73,7 @@ describe("ApprovalsPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Send payment to vendor")).toBeInTheDocument();
     });
-    expect(screen.getByText("critical")).toBeInTheDocument();
+    expect(screen.getByText("critical risk")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reject" })).toBeInTheDocument();
   });
@@ -78,7 +85,7 @@ describe("ApprovalsPage", () => {
     render(<ApprovalsPage />);
 
     await user.type(
-      await screen.findByPlaceholderText("Optional reason for your decision..."),
+      await screen.findByPlaceholderText(/Optional context recorded/),
       "Approved by finance"
     );
     await user.click(screen.getByRole("button", { name: "Approve" }));
@@ -112,16 +119,14 @@ describe("ApprovalsPage", () => {
   it("surfaces decision errors without losing the approval", async () => {
     approveRequestMock.mockRejectedValue(new Error("Approval already processed"));
     listApprovalsMock.mockResolvedValue({ approvals: [pendingApproval], total: 1 });
-    const alertMock = vi.spyOn(window, "alert").mockImplementation(() => {});
     const user = userEvent.setup();
     render(<ApprovalsPage />);
 
     await user.click(await screen.findByRole("button", { name: "Approve" }));
 
     await waitFor(() => {
-      expect(alertMock).toHaveBeenCalledWith("Approval already processed");
+      expect(screen.getByText("Approval already processed")).toBeInTheDocument();
     });
     expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
-    alertMock.mockRestore();
   });
 });

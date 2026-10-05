@@ -1,22 +1,29 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import NewRequestPage from "@/app/requests/new/page";
+import ExecutePage from "@/app/execute/page";
 
-const { pushMock, backMock, createRequestMock, executeRequestMock, executeAsyncMock } = vi.hoisted(() => ({
-  pushMock: vi.fn(),
-  backMock: vi.fn(),
-  createRequestMock: vi.fn(),
-  executeRequestMock: vi.fn(),
-  executeAsyncMock: vi.fn(),
-}));
+const { pushMock, backMock, createRequestMock, executeRequestMock, executeAsyncMock } =
+  vi.hoisted(() => ({
+    pushMock: vi.fn(),
+    backMock: vi.fn(),
+    createRequestMock: vi.fn(),
+    executeRequestMock: vi.fn(),
+    executeAsyncMock: vi.fn(),
+  }));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: pushMock, back: backMock }),
+  usePathname: () => "/execute",
 }));
 
-vi.mock("@/components/Sidebar", () => ({
-  default: () => <nav>Sidebar</nav>,
+vi.mock("@/components/shell/AppShell", () => ({
+  default: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <div>
+      {actions}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -35,7 +42,7 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
-describe("NewRequestPage", () => {
+describe("ExecutePage", () => {
   beforeEach(() => {
     pushMock.mockReset();
     backMock.mockReset();
@@ -48,7 +55,7 @@ describe("NewRequestPage", () => {
 
   it("disables submit until the intent is long enough", async () => {
     const user = userEvent.setup();
-    render(<NewRequestPage />);
+    render(<ExecutePage />);
 
     const submit = screen.getByRole("button", { name: "Submit & Execute" });
     expect(submit).toBeDisabled();
@@ -63,7 +70,7 @@ describe("NewRequestPage", () => {
   it("creates the request, submits via async queue, and navigates to the detail page", async () => {
     createRequestMock.mockResolvedValue({ id: "req-new-1", status: "created" });
     const user = userEvent.setup();
-    render(<NewRequestPage />);
+    render(<ExecutePage />);
 
     await user.type(
       screen.getByLabelText("Task Description"),
@@ -87,7 +94,7 @@ describe("NewRequestPage", () => {
     executeAsyncMock.mockRejectedValue(new Error("queue unavailable"));
     executeRequestMock.mockResolvedValue({ status: "completed" });
     const user = userEvent.setup();
-    render(<NewRequestPage />);
+    render(<ExecutePage />);
 
     await user.type(
       screen.getByLabelText("Task Description"),
@@ -106,7 +113,7 @@ describe("NewRequestPage", () => {
     executeAsyncMock.mockRejectedValue(new Error("queue unavailable"));
     executeRequestMock.mockRejectedValue(new Error("worker busy"));
     const user = userEvent.setup();
-    render(<NewRequestPage />);
+    render(<ExecutePage />);
 
     await user.type(
       screen.getByLabelText("Task Description"),
@@ -122,7 +129,7 @@ describe("NewRequestPage", () => {
   it("shows the error when request creation fails", async () => {
     createRequestMock.mockRejectedValue(new Error("Request validation failed"));
     const user = userEvent.setup();
-    render(<NewRequestPage />);
+    render(<ExecutePage />);
 
     await user.type(
       screen.getByLabelText("Task Description"),
@@ -138,7 +145,7 @@ describe("NewRequestPage", () => {
 
   it("cancel goes back without submitting", async () => {
     const user = userEvent.setup();
-    render(<NewRequestPage />);
+    render(<ExecutePage />);
 
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(backMock).toHaveBeenCalled();

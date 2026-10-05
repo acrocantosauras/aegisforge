@@ -11,6 +11,7 @@ const { pushMock, loginMock, registerMock } = vi.hoisted(() => ({
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: pushMock, back: vi.fn() }),
+  usePathname: () => "/",
 }));
 
 vi.mock("@/lib/auth", () => ({

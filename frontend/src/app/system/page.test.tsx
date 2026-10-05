@@ -8,11 +8,17 @@ const { pushMock, systemStatusMock } = vi.hoisted(() => ({
 }));
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: pushMock }),
+  useRouter: () => ({ push: pushMock, back: vi.fn() }),
+  usePathname: () => "/",
 }));
 
-vi.mock("@/components/Sidebar", () => ({
-  default: () => <nav>Sidebar</nav>,
+vi.mock("@/components/shell/AppShell", () => ({
+  default: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <div>
+      {actions}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -22,6 +28,7 @@ vi.mock("@/lib/auth", () => ({
 vi.mock("@/lib/api", () => ({
   apiClient: {
     systemStatus: systemStatusMock,
+    listAuditEvents: vi.fn().mockResolvedValue({ events: [] }),
   },
 }));
 
@@ -83,9 +90,9 @@ describe("SystemPage", () => {
     expect(screen.getByText("API")).toBeInTheDocument();
     expect(screen.getByText("Database")).toBeInTheDocument();
     expect(screen.getByText("Redis")).toBeInTheDocument();
-    expect(screen.getAllByText("Healthy")).toHaveLength(3);
-    expect(screen.getByText("2 active")).toBeInTheDocument();
-    expect(screen.getByText("3")).toBeInTheDocument(); // queue depth
+    expect(screen.getAllByText("healthy")).toHaveLength(7);
+    expect(screen.getByText(/2\/2/)).toBeInTheDocument();
+    expect(screen.getByText(/3 · pending jobs/)).toBeInTheDocument(); // queue depth
   });
 
   it("renders the worker registry with heartbeat ages and status badges", async () => {
@@ -99,7 +106,7 @@ describe("SystemPage", () => {
     expect(screen.getByText("worker-2")).toBeInTheDocument();
     expect(screen.getByText("1.2s ago")).toBeInTheDocument();
     expect(screen.getByText("2.5s ago")).toBeInTheDocument();
-    expect(screen.getAllByText("healthy")).toHaveLength(2);
+    expect(screen.getAllByText("healthy")).toHaveLength(7);
   });
 
   it("shows an empty state when no workers have heartbeated", async () => {
@@ -121,8 +128,8 @@ describe("SystemPage", () => {
       expect(screen.getByText("DEGRADED")).toBeInTheDocument();
     });
 
-    expect(screen.getAllByText("Unavailable")).toHaveLength(1); // Redis
-    expect(screen.getAllByText("Healthy")).toHaveLength(2); // API + database still ok
+    expect(screen.getAllByText("unavailable")).toHaveLength(2); // Redis + workers
+    expect(screen.getAllByText("healthy")).toHaveLength(3); // API + database + queue
   });
 
   it("reloads status when Refresh is clicked", async () => {
@@ -144,6 +151,7 @@ describe("SystemPage", () => {
 
   it("surfaces a load failure without fabricating status", async () => {
     systemStatusMock.mockRejectedValue(new Error("system status unavailable"));
+    const user = userEvent.setup();
     render(<SystemPage />);
 
     await waitFor(() => {
@@ -151,6 +159,17 @@ describe("SystemPage", () => {
     });
 
     expect(screen.queryByText("HEALTHY")).not.toBeInTheDocument();
-    expect(screen.getByText(/Loading system status/)).toBeInTheDocument();
+    // No status means no data: the page must offer recovery instead of
+    // showing an indefinite loading indicator.
+    expect(screen.queryByText(/Probing components/)).not.toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: /Retry/ });
+    expect(retry).toBeInTheDocument();
+
+    systemStatusMock.mockResolvedValue(HEALTHY);
+    await user.click(retry);
+
+    await waitFor(() => {
+      expect(screen.getByText("HEALTHY")).toBeInTheDocument();
+    });
   });
 });

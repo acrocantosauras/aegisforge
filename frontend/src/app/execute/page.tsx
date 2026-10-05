@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import Sidebar from "@/components/Sidebar";
+import AppShell from "@/components/shell/AppShell";
+import { ErrorBox } from "@/components/ui/states";
 import { useAuth } from "@/lib/auth";
 import { apiClient } from "@/lib/api";
 
@@ -32,7 +33,7 @@ const EXAMPLES: { label: string; intent: string }[] = [
   },
 ];
 
-export default function NewRequestPage() {
+export default function ExecutePage() {
   const { token, isAuthenticated, isLoading } = useAuth();
   const router = useRouter();
 
@@ -65,35 +66,18 @@ export default function NewRequestPage() {
   };
 
   return (
-    <div className="layout">
-      <Sidebar />
-      <main className="main-content">
-        <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>
-          New Request
-        </h1>
-        <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 20 }}>
-          AegisForge plans your request into a task graph and executes it with
-          specialized agents — research, RAG over private knowledge, analysis,
-          and synthesis — with durable checkpoints and human approval gates for
-          high-risk actions.
-        </p>
-
-        <div className="card" style={{ maxWidth: 760 }}>
-          <h2 style={{ marginBottom: 16 }}>Describe the task</h2>
-
-          {error && (
-            <div
-              className="error"
-              style={{
-                marginBottom: 16,
-                padding: 12,
-                background: "#f8d7da",
-                borderRadius: 6,
-              }}
-            >
-              {error}
-            </div>
-          )}
+    <AppShell
+      title="Execute"
+      subtitle="Describe the work. The planner decomposes it into a validated task graph and specialized agents execute it — with durable checkpoints and approval gates for high-risk actions."
+      actions={
+        <button className="ghost" onClick={() => router.push("/history")}>
+          View history
+        </button>
+      }
+    >
+      <div className="composer">
+        <div className="card">
+          {error && <ErrorBox>{error}</ErrorBox>}
 
           <form onSubmit={handleSubmit}>
             <div className="form-group">
@@ -102,28 +86,25 @@ export default function NewRequestPage() {
                 id="intent"
                 value={intent}
                 onChange={(e) => setIntent(e.target.value)}
-                rows={5}
-                placeholder="e.g., Research the latest developments in AI agent frameworks and provide a comparison..."
+                placeholder="e.g., Research the latest developments in AI agent frameworks and provide a comparison against our internal policy documents…"
                 required
                 minLength={10}
                 maxLength={2000}
               />
-              <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
-                {intent.length}/2000 characters
-              </p>
+              <p className="char-count">{intent.length}/2000</p>
             </div>
 
-            <div style={{ display: "flex", gap: 12 }}>
+            <div className="row">
               <button
                 type="submit"
                 className="primary"
                 disabled={loading || intent.length < 10}
               >
-                {loading ? "Submitting…" : "Submit & Execute"}
+                {loading ? "Submitting to planner…" : "Submit & Execute"}
               </button>
               <button
                 type="button"
-                className="secondary"
+                className="ghost"
                 onClick={() => router.back()}
               >
                 Cancel
@@ -132,34 +113,35 @@ export default function NewRequestPage() {
           </form>
         </div>
 
-        <div className="card" style={{ maxWidth: 760, marginTop: 16 }}>
-          <h2 style={{ fontSize: 14, marginBottom: 10 }}>
-            Example requests (real planner shapes)
+        <div className="card" style={{ marginTop: 16 }}>
+          <h2 style={{ fontSize: "var(--text-h3)", marginBottom: 4 }}>
+            Example requests
           </h2>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <p className="t-caption" style={{ marginBottom: 12 }}>
+            These map to actual planner decomposition rules — the resulting task
+            graph, agents, and approval gates you will see are the real ones.
+          </p>
+          <div className="intent-examples">
             {EXAMPLES.map((ex) => (
               <button
                 key={ex.label}
                 type="button"
-                className="secondary"
-                style={{ textAlign: "left", fontSize: 13 }}
+                className="intent-example"
                 onClick={() => setIntent(ex.intent)}
               >
-                <strong>{ex.label}</strong>
-                <br />
-                <span style={{ color: "var(--muted)", fontSize: 12 }}>
-                  {ex.intent}
-                </span>
+                <span className="label">{ex.label}</span>
+                <span className="intent">{ex.intent}</span>
               </button>
             ))}
           </div>
-          <p style={{ fontSize: 11, color: "var(--muted)", marginTop: 10 }}>
-            These examples map to actual planner decomposition rules — the
-            resulting task graph, agents, and approval gates you will see are
-            the real ones.
-          </p>
         </div>
-      </main>
-    </div>
+
+        <p className="t-caption" style={{ marginTop: 14, maxWidth: 640 }}>
+          Execution runs on the distributed worker queue with checkpointing.
+          High-risk tool actions pause the workflow for human approval before
+          proceeding.
+        </p>
+      </div>
+    </AppShell>
   );
 }

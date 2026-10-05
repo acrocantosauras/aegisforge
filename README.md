@@ -128,13 +128,19 @@ Audit Trail
 - Configurable thresholds, max evaluation loops
 
 #### React/Next.js Frontend
-- Login/Register with JWT authentication
-- Dashboard with stats, recent requests, pending approvals
-- Create Request page with task submission
-- Workflow Detail page with execution state and results
-- Approval UI with approve/reject controls
-- Documents & Knowledge Base with upload and management
-- Execution Logs with sanitized audit events
+- Marketing landing page, login/register with JWT authentication
+- Dashboard with tenant-scoped stats, recent executions, pending approvals
+- Execute page: task submission with real planner example intents
+- Execution workspace (`/requests/{id}`): live task graph with dependency
+  edges, execution timeline, per-task tool/risk/approval detail, evaluation,
+  cited final result, approval gates, and refresh recovery
+- Execution history with status filters and search
+- Agents registry, Knowledge/document upload, Tools & MCP catalogs
+- Approval queue with approve/reject decisions
+- System health with live component status, worker registry, and audit trail
+- Settings showing the session's decoded JWT claims (read-only)
+- Responsive layout (1440/1280/1024/768), loading/empty/error/retry states,
+  keyboard-focusable controls, and dialog focus trapping
 
 #### API Endpoints Added
 - `POST /api/v1/documents` — Upload and ingest documents
@@ -343,7 +349,7 @@ Copy `.env.example` to `.env` and configure:
 ## Testing
 
 ```bash
-# Backend tests (382 tests; integration tests are skipped unless enabled)
+# Backend tests (integration tests are skipped unless enabled)
 pytest -v
 
 # With coverage
@@ -352,7 +358,9 @@ pytest --cov=aegisforge --cov-report=term-missing
 # Real PostgreSQL + pgvector + Redis integration tests (requires services)
 docker compose up -d postgres redis
 docker compose run --rm api alembic upgrade head
-AEGISFORGE_INTEGRATION_TESTS=true pytest -q tests/integration
+# REDIS_PASSWORD must match the compose Redis; without it the host-side
+# client connects unauthenticated and every Redis test errors in setup.
+AEGISFORGE_INTEGRATION_TESTS=true REDIS_PASSWORD=aegisforge-dev-redis-password pytest -q tests/integration
 
 # Frontend tests
 cd frontend && npm test
@@ -361,11 +369,11 @@ cd frontend && npm test
 pytest tests/test_workflow.py -v
 ```
 
-> **Note:** The default `pytest` run reports `426 passed, 29 skipped`. The 23
-> skipped are real-infrastructure integration tests that only run with
-> `AEGISFORGE_INTEGRATION_TESTS=true` (23 passing when services are up). The
-> frontend suite adds 35 component/behavioral tests via `npm test`. Real-LLM
-> tests remain opt-in via `AEGISFORGE_REAL_LLM_TESTS=true` and are not run in CI.
+> **Note:** The default `pytest` run reports `741 passed, 121 skipped`. The
+> skipped set is real-infrastructure integration and real-LLM coverage that
+> only runs when enabled: `AEGISFORGE_INTEGRATION_TESTS=true` (32 passing when
+> services are up) and `AEGISFORGE_REAL_LLM_TESTS=true` (never run in CI). The
+> frontend suite adds 66 component/behavioral tests via `npm test`.
 
 ### Test Categories
 
@@ -400,7 +408,7 @@ pytest tests/test_workflow.py -v
 | Security 4.2 | `test_security_phase42.py` | 5 | Tenant isolation, authorization, secrets recheck |
 | Integration | `tests/integration/` | 29 | Real PostgreSQL/pgvector + Redis (opt-in via env flag), including hybrid retrieval |
 | MCP Lifecycle | `tests/test_mcp_lifecycle.py` | 21 | MCP lifecycle, health, timeout, failure-mode, deny-by-default, allow-list, no-secrets |
-| Frontend | `frontend/src/**/*.test.*` | 35 | API client, auth, login, dashboard, approvals, documents, requests |
+| Frontend | `frontend/src/**/*.test.*` | 66 | API client, auth, landing, login, dashboard, execute, history, requests, agents, tools, documents, approvals, system, settings |
 
 ## Documentation
 
@@ -415,9 +423,12 @@ pytest tests/test_workflow.py -v
 ## Known Limitations
 
 - Deterministic/planner agents used by default; real LLM requires API keys
+- Aggregate `GET /evaluation/metrics` is served from the API process's
+  in-process collector, so it is empty for worker-executed runs and is not
+  tenant-filtered. The dashboard therefore derives its statistics from the
+  tenant-scoped request list instead of that endpoint.
 - pgvector requires PostgreSQL with pgvector extension (Docker Compose handles this)
 - Redis async execution requires Redis running
-- Frontend is a functional skeleton — needs production styling and error handling
 - LLM critic requires a configured LLM provider
 - No distributed workflow execution (single worker)
 - No production monitoring/alerting rules
