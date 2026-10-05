@@ -55,6 +55,11 @@ services:
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
       EMBEDDING_DIMENSION: "384"
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      # Browser frontend origin(s). The app runs on :3131 in local dev; :3000
+      # is kept for the bundled compose frontend service. Without this the
+      # default (http://localhost:3000) makes every authenticated browser call
+      # fail its CORS preflight.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3131}
     depends_on:
       postgres:
         condition: service_healthy

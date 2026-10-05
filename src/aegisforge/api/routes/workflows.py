@@ -431,6 +431,17 @@ def get_workflow_evaluations(
                 if str(rec.get("agent_type", "")) == "synthesis":
                     final_output = rec.get("output") or {}
                     break
+            if not final_output:
+                # Serial (single-task) runs never produce a synthesis record.
+                # Score the same final answer GET /result exposes, otherwise the
+                # final-response domain reports produced=False / score 0.00 for a
+                # run that did produce a result.
+                agent_result = state.get("agent_result") or {}
+                final_output = agent_result.get("result") or {}
+            if not final_output:
+                candidate = _pick_final_agent_result(records, plan)
+                if candidate is not None:
+                    final_output = candidate.get("output") or {}
             evaluation = evaluate_workflow_run(
                 plan, records, final_output=final_output
             ).to_dict()

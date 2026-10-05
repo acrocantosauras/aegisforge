@@ -21,6 +21,7 @@ from aegisforge.domain.models import (
     ExecutionPlan,
     RequestStatus,
     RiskLevel,
+    TaskExecutionRecord,
 )
 from aegisforge.evaluation.critic import LLMCritic
 from aegisforge.llm.providers import ModelProvider
@@ -551,6 +552,48 @@ def _pick_final_agent_result(
     return records[completed[-1]]
 
 
+def _serial_task_record(
+    state: dict[str, Any],
+    status: AgentExecutionStatus,
+) -> dict[str, Any] | None:
+    """Build a task record for the classic serial path's current task.
+
+    The serial path (single-task / legacy no-dependency plans) stores only
+    the latest ``agent_result``; without a record the durable checkpoint
+    carries no ``task_records`` entry and workflow introspection reports the
+    task as ``pending`` even after the run reached a terminal state. This
+    projects the executed result into the same record shape the multi-agent
+    scheduler uses, so GET /workflows/{id} and /tasks reflect real state.
+
+    Only called from terminal branches, so it never affects resume routing
+    (see ``_is_multi_agent_run``, which keys off ``task_records``).
+    Returns None when no current task can be resolved.
+    """
+    task = state.get("current_task") or {}
+    task_id = str(task.get("task_id", ""))
+    if not task_id:
+        return None
+    agent_result = state.get("agent_result") or {}
+    record = TaskExecutionRecord(
+        task_id=task_id,
+        description=str(task.get("description", "")),
+        agent_type=task.get("assigned_agent_type")
+        or agent_result.get("agent_type", ""),
+        status=status,
+        dependencies=list(task.get("dependencies", []) or []),
+        retry_count=int(state.get("retry_count", 0) or 0),
+        max_retries=int(task.get("max_retries", 2) or 2),
+        timeout_seconds=float(task.get("timeout_seconds", 120.0) or 120.0),
+        duration_ms=agent_result.get("execution_time_ms"),
+        summary=str(agent_result.get("summary", "") or ""),
+        output=dict(agent_result.get("result", {}) or {}),
+        evidence=list(agent_result.get("evidence", []) or []),
+        tool_calls=list(agent_result.get("tool_calls", []) or []),
+        errors=list(agent_result.get("errors", []) or []),
+    )
+    return record.model_dump(mode="json")
+
+
 def multi_agent_execute_node(state: dict[str, Any]) -> dict[str, Any]:
     """Execute a multi-task plan with the dependency-aware engine.
 
@@ -979,11 +1022,18 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
         next_index = task_index + 1
         if next_index >= len(tasks):
             recovery_decision["action"] = "workflow_completed"
+            records = dict(state.get("task_records", {}) or {})
+            completed_record = _serial_task_record(
+                state, AgentExecutionStatus.COMPLETED
+            )
+            if completed_record is not None:
+                records[completed_record["task_id"]] = completed_record
             result_state = _copy_state(
                 state,
                 status=RequestStatus.COMPLETED.value,
                 final_result=state.get("agent_result", {}),
                 current_task_index=next_index,
+                task_records=records,
                 evaluation_loop_count=eval_loop_count,
                 recovery_decision=recovery_decision,
             )
@@ -1026,12 +1076,17 @@ def retry_or_complete_node(state: dict[str, Any]) -> dict[str, Any]:
     # Terminal failure
     recovery_decision["action"] = "terminal_failure"
     recovery_decision["reasons"] = evaluation.reasons
+    records = dict(state.get("task_records", {}) or {})
+    failed_record = _serial_task_record(state, AgentExecutionStatus.FAILED)
+    if failed_record is not None:
+        records[failed_record["task_id"]] = failed_record
     result_state = _copy_state(
         state,
         status=RequestStatus.FAILED.value,
         errors=list(state.get("errors", [])) + [
             f"Evaluation failed: {'; '.join(evaluation.reasons)}"
         ],
+        task_records=records,
         evaluation_loop_count=eval_loop_count,
         recovery_decision=recovery_decision,
     )
