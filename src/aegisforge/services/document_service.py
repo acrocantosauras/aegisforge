@@ -126,7 +126,7 @@ def ingest_and_store_document(
             # write side must carry the same scope.
             store.add(entries, organization_id=organization_id, owner_id=owner_id)
             indexed = True
-    except Exception as exc:  # noqa: BLE001 - indexing must not lose the document
+    except Exception as exc:
         indexing_error = str(exc)
         logger.warning("Vector storage failed (non-fatal): %s", exc)
 

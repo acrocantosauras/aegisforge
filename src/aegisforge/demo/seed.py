@@ -142,7 +142,7 @@ def delete_demo_documents(
                 organization_id=organization_id,
                 owner_id=owner_id,
             )
-        except Exception as exc:  # noqa: BLE001 - reset must still clear rows
+        except Exception as exc:
             logger.warning(
                 "Vector cleanup failed for demo document %s: %s", document.id, exc
             )
@@ -216,7 +216,7 @@ def seed_demo_documents(
                     organization_id=organization_id,
                     owner_id=owner_id,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "Vector cleanup failed for demo document %s: %s", document_id, exc
                 )

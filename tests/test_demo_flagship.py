@@ -16,9 +16,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from aegisforge.app import create_app
-from aegisforge.agents.planner import PlannerAgent
 from aegisforge.agents.base import AgentExecutionContext
+from aegisforge.agents.planner import PlannerAgent
+from aegisforge.app import create_app
 from aegisforge.config import Settings
 from aegisforge.db.base import Base
 from aegisforge.db.models import DocumentModel
@@ -320,7 +320,7 @@ class TestDemoSeeding:
                 == len(
                     [
                         e
-                        for e in store._entries  # noqa: SLF001 - asserting cleanup
+                        for e in store._entries
                         if e.metadata.get("document_id") == "user-doc-1"
                     ]
                 )

@@ -31,11 +31,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from aegisforge.config import Settings  # noqa: E402
-from aegisforge.db.models import UserModel  # noqa: E402
-from aegisforge.db.session import get_engine, get_session_factory  # noqa: E402
-from aegisforge.demo.seed import seed_demo_documents  # noqa: E402
-from aegisforge.demo.scenario import DEMO_DOCUMENTS, document_id_for  # noqa: E402
+from aegisforge.config import Settings
+from aegisforge.db.models import UserModel
+from aegisforge.db.session import get_engine, get_session_factory
+from aegisforge.demo.scenario import DEMO_DOCUMENTS, document_id_for
+from aegisforge.demo.seed import seed_demo_documents
 
 
 def _parse_args() -> argparse.Namespace:
@@ -101,7 +101,7 @@ def main() -> int:
 
         if args.dry_run:
             # Report existing state without writing.
-            from aegisforge.demo.seed import _expected_content_hash, _existing_document
+            from aegisforge.demo.seed import _existing_document, _expected_content_hash
 
             for document in DEMO_DOCUMENTS:
                 existing = _existing_document(

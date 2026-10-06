@@ -106,9 +106,16 @@ Preview without writing: `--dry-run`. Reset: `scripts/reset_demo.py --email …`
    analysis → synthesis), real tool activity, retrieved evidence, the
    evaluation grid, and a grounded final report.
 
-Refresh at any point — the workspace restores from durable state. The run is
-reproducible: same corpus + same deterministic planner + same deterministic
-embeddings ⇒ same citations, same conflict count, same evaluation score.
+Refresh at any point — the workspace restores from durable state.
+
+**Deterministic under the configured deterministic embedding provider.** With
+the default local provider (`EMBEDDING_PROVIDER=deterministic`), the
+deterministic planner, and the same corpus, the run repeats exactly: same
+citations, same conflict count, same evaluation score. That reproducibility is a
+property of those settings, not a universal guarantee — configure a remote
+embedding provider (e.g. `EMBEDDING_PROVIDER=openai`) and the vectors change, so
+retrieval ranking, citations, conflict counts and evaluation scores can all
+differ.
 
 ## Notes
 

@@ -647,6 +647,98 @@ class TestSynthesisQuality:
 
 
 # =========================================================================
+# Phase 10: polarity classification has exactly one source of truth
+# =========================================================================
+
+
+class TestPolaritySingleSourceOfTruth:
+    """Analysis conflict detection and synthesis contradiction detection must
+    classify stance with the *same* function.
+
+    Phase 10 removed an inline marker list from
+    ``synthesis_agent._detect_contradictions``.  If a second classifier is ever
+    reintroduced, the same pair of statements can be judged a conflict by one
+    stage and consistent by the other, so both paths are asserted against
+    ``analysis_agent.evidence_polarity`` directly.
+    """
+
+    # ``not available`` is handled by the shared classifier's negation-first
+    # marker list but was absent from the shortened list Synthesis used to carry
+    # inline, so this text only classifies correctly through the shared one.
+    NEGATIVE = "Customer-managed keys are not available on this tier."
+    POSITIVE = "Customer-managed keys are required for regulated workloads."
+
+    def test_synthesis_reuses_the_analysis_classifier(self) -> None:
+        """Synthesis must import, not re-derive, the shared classifier."""
+        from aegisforge.agents import analysis_agent, synthesis_agent
+
+        assert synthesis_agent.evidence_polarity is analysis_agent.evidence_polarity
+        assert (
+            synthesis_agent.evidence_polarity.__module__
+            == "aegisforge.agents.analysis_agent"
+        )
+        # No second marker list / precedence logic lives in the synthesis module.
+        assert not hasattr(synthesis_agent, "_NEGATIVE_MARKERS")
+        assert not hasattr(synthesis_agent, "_POSITIVE_MARKERS")
+
+    def test_analysis_conflict_reports_the_shared_classification(self) -> None:
+        """Analysis conflicts carry the labels the shared classifier produced."""
+        from aegisforge.agents.analysis_agent import analyze_evidence, evidence_polarity
+
+        analysis = analyze_evidence(
+            "customer managed keys",
+            [
+                {"content": self.NEGATIVE, "source": "vendor-brief.md", "relevance": 0.9},
+                {"content": self.POSITIVE, "source": "security-baseline.md", "relevance": 0.9},
+            ],
+        )
+        assert analysis["conflicts"], "opposing stances must surface as a conflict"
+        conflict = analysis["conflicts"][0]
+        assert conflict["left"]["polarity"] == evidence_polarity(self.NEGATIVE)
+        assert conflict["right"]["polarity"] == evidence_polarity(self.POSITIVE)
+        assert {conflict["left"]["polarity"], conflict["right"]["polarity"]} == {
+            "negative",
+            "positive",
+        }
+
+    def test_synthesis_contradiction_uses_the_same_classification(self) -> None:
+        """The very same pair must contradict in synthesis, with the same labels.
+
+        Under the inline classifier Synthesis used before Phase 10, the negative
+        statement above came back ``neutral`` and no contradiction was reported
+        — the regression this test pins.
+        """
+        from aegisforge.agents.analysis_agent import evidence_polarity
+
+        result = synthesize_results(
+            "customer managed keys",
+            [
+                {
+                    "agent": "vendor-brief",
+                    "status": "completed",
+                    "summary": self.NEGATIVE,
+                    "result": {"answer": self.NEGATIVE},
+                },
+                {
+                    "agent": "security-baseline",
+                    "status": "completed",
+                    "summary": self.POSITIVE,
+                    "result": {"answer": self.POSITIVE},
+                },
+            ],
+        )
+        assert result["contradictions"], "the same pair must contradict in synthesis too"
+        contradiction = result["contradictions"][0]
+        assert contradiction["type"] == "polarity_conflict"
+        assert contradiction["polarity_left"] == evidence_polarity(self.NEGATIVE)
+        assert contradiction["polarity_right"] == evidence_polarity(self.POSITIVE)
+        assert {
+            contradiction["polarity_left"],
+            contradiction["polarity_right"],
+        } == {"negative", "positive"}
+
+
+# =========================================================================
 # 5.3G: Intelligence Observability
 # =========================================================================
 

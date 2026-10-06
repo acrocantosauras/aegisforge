@@ -94,9 +94,14 @@ ingestion pipeline in the product, and the demo uses it.
 
 Properties:
 
-- **Deterministic** — document ids are `demo-<owner-tag>-<slug>`; the configured
-  embedding provider is deterministic, so chunk counts, vectors, citations and
-  evaluation scores repeat exactly.
+- **Deterministic under the configured settings** — document ids are
+  `demo-<owner-tag>-<slug>` (derived from slug + owner, so stable regardless of
+  provider). Chunk counts, vectors, citations, conflict counts and evaluation
+  scores repeat exactly *because* the deterministic embedding provider is
+  configured (`EMBEDDING_PROVIDER=deterministic`, the default) alongside the
+  deterministic planner/LLM settings. This is not universal: a remote embedding
+  provider changes the vectors, so ranking, citations and every number derived
+  from them can differ.
 - **Idempotent** — a document already present for the same organization + owner
   with the same content hash is skipped. Drift (changed corpus file) is detected
   by hash and re-ingested under the same id.
@@ -126,8 +131,13 @@ Properties:
 | Tool activity + risk + approval | `GET /tools`, `GET /mcp/tools` | `knowledge.search` recorded on the research task |
 | Evidence | `GET /workflows/{id}/result` | 9 cited evidence items in the observed run |
 | **Workflow** evaluation grid | `GET /workflows/{id}/evaluations` | observed: planning 1.00 · collaboration 0.85 · final response 1.00 · overall 0.95 |
-| Final report | `GET /workflows/{id}/result` | 9 citations, conflicts section, sources, evidence quality; synthesis confidence 0.24 |
+| Final report | `GET /workflows/{id}/result` | observed: 9 citations, conflicts section, sources, evidence quality; synthesis confidence 0.24 |
 | Timeline | task records | request → 4 tasks → evaluation → result |
+
+Every numeric value in this table (citation counts, evaluation scores,
+confidence) is an **observed measurement from the verified demo run** under the
+configured deterministic embedding provider — a reported figure, not a
+universal guarantee.
 
 No chain-of-thought is exposed anywhere: only task summaries, evidence metadata,
 citations, and measured scores.
@@ -231,8 +241,12 @@ states.
   and persisted in the durable checkpoint, so it survives restarts for a run; it
   is not exposed by the aggregate in-process `/evaluation/metrics` endpoint.
 - **Deterministic embeddings.** The default local embedding provider is a
-  bag-of-words hash, so similarity is lexical. A configured provider
-  (`EMBEDDING_PROVIDER=openai`) changes ranking quality, not the architecture.
+  bag-of-words hash, so similarity is lexical, and under it the run repeats
+  exactly. A configured remote provider (`EMBEDDING_PROVIDER=openai`) changes
+  vectors, ranking quality and citations — not the architecture — so any
+  citation count, evaluation score or confidence figure quoted in this document
+  is an observed value from a run under the deterministic provider, and can
+  differ under another provider.
 - **Confidence is conservative and is a synthesis field, not the workflow score.**
   With mixed-quality evidence the demo reports synthesis confidence around **0.24** on
   `GET /workflows/{id}/result`. The **workflow evaluation** on

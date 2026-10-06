@@ -21,10 +21,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from aegisforge.config import Settings  # noqa: E402
-from aegisforge.db.models import UserModel  # noqa: E402
-from aegisforge.db.session import get_session_factory  # noqa: E402
-from aegisforge.demo.seed import delete_demo_documents  # noqa: E402
+from aegisforge.config import Settings
+from aegisforge.db.models import UserModel
+from aegisforge.db.session import get_session_factory
+from aegisforge.demo.seed import delete_demo_documents
 
 
 def _parse_args() -> argparse.Namespace:
